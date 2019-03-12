@@ -14,13 +14,13 @@ import (
 )
 
 type BackupMetadata struct {
-	metadata *pb.BackupMetadata
-	lock     *sync.Mutex
+	pb.BackupMetadata
+	lock *sync.Mutex
 }
 
 func NewBackupMetadata(opts *pb.StartBackup) *BackupMetadata {
 	return &BackupMetadata{
-		metadata: &pb.BackupMetadata{
+		BackupMetadata: pb.BackupMetadata{
 			StartTs:         time.Now().UTC().Unix(),
 			StorageName:     opts.GetStorageName(),
 			BackupType:      opts.GetBackupType(),
@@ -37,14 +37,14 @@ func NewBackupMetadata(opts *pb.StartBackup) *BackupMetadata {
 func (b *BackupMetadata) AddReplicaset(clusterID, replName, replUUID, dbBackupName, oplogBackupName string) error {
 	b.lock.Lock()
 
-	if _, ok := b.metadata.Replicasets[replName]; ok {
+	if _, ok := b.Replicasets[replName]; ok {
 		return fmt.Errorf("Info for replicaset %s already exists", replName)
 	}
 
 	// Key is replicaset name instead of UUID because the UUID is randomly generated so, on a
 	// new and shiny environment created to restore a backup, the UUID will be different.
 	// On restore, we will try to restore each replicaset by name to the matching cluster.
-	b.metadata.Replicasets[replName] = &pb.ReplicasetMetadata{
+	b.Replicasets[replName] = &pb.ReplicasetMetadata{
 		ClusterId:       clusterID,
 		ReplicasetUuid:  replUUID,
 		ReplicasetName:  replName,
@@ -62,27 +62,27 @@ func LoadMetadataFromFile(name string) (*BackupMetadata, error) {
 		return nil, err
 	}
 	metadata := &BackupMetadata{
-		metadata: &pb.BackupMetadata{
+		BackupMetadata: pb.BackupMetadata{
 			Replicasets: make(map[string]*pb.ReplicasetMetadata),
 		},
 		lock: &sync.Mutex{},
 	}
-	err = json.Unmarshal(buf, &metadata.metadata)
+	err = json.Unmarshal(buf, &metadata)
 	return metadata, err
 }
 
-func (b *BackupMetadata) Metadata() *pb.BackupMetadata {
-	return b.metadata
-}
+//func (b *BackupMetadata) Metadata() *pb.BackupMetadata {
+//	return b.metadata
+//}
 
 func (b *BackupMetadata) RemoveReplicaset(replName string) error {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 
-	if _, ok := b.metadata.Replicasets[replName]; !ok {
+	if _, ok := b.Replicasets[replName]; !ok {
 		return fmt.Errorf("Info for replicaset %s doesn't exists", replName)
 	}
-	delete(b.metadata.Replicasets, replName)
+	delete(b.Replicasets, replName)
 	return nil
 }
 
@@ -91,7 +91,7 @@ func (b *BackupMetadata) WriteMetadataToFile(name string) error {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 
-	buf, err := json.MarshalIndent(b.metadata, "", "    ")
+	buf, err := json.MarshalIndent(b, "", "    ")
 	if err != nil {
 		return errors.Wrap(err, "cannot encode backup metadata")
 	}
@@ -102,6 +102,6 @@ func (b *BackupMetadata) JSONBytes() ([]byte, error) {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 
-	buf, err := json.MarshalIndent(b.metadata, "", "    ")
+	buf, err := json.MarshalIndent(b, "", "    ")
 	return buf, err
 }

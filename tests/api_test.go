@@ -122,15 +122,15 @@ func TestApiWithDaemon(t *testing.T) {
 		t.Fatalf("Cannot load metadata from file %s: %v", metadataFile, err)
 	}
 
-	if md.Metadata().Description == "" {
+	if md.Description == "" {
 		t.Errorf("Empty description in backup metadata")
 	}
 
-	if len(md.Metadata().Replicasets) < 3 {
-		t.Errorf("Invalid replicasets count in metadata. Want 3, got %d", len(md.Metadata().Replicasets))
+	if len(md.Replicasets) < 3 {
+		t.Errorf("Invalid replicasets count in metadata. Want 3, got %d", len(md.Replicasets))
 	}
 
-	mrs1, ok := md.Metadata().Replicasets["rs1"]
+	mrs1, ok := md.Replicasets["rs1"]
 	if !ok {
 		t.Errorf("Missing rs1 in backup metadata")
 	} else if mrs1.GetClusterId() == "" {

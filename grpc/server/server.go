@@ -163,7 +163,7 @@ func (s *MessagesServer) BackupSourceNameByReplicaset() (map[string]string, erro
 	return sources, nil
 }
 
-func (s *MessagesServer) RestoreSourcesByReplicaset(bm *pb.BackupMetadata, storageName string) (
+func (s *MessagesServer) RestoreSourcesByReplicaset(bm *BackupMetadata, storageName string) (
 	map[string]RestoreSource, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -337,13 +337,13 @@ func (s *MessagesServer) LastBackupMetadata() *BackupMetadata {
 	return s.backupStatus.lastBackupMetadata
 }
 
-func (s *MessagesServer) ListBackups() (map[string]pb.BackupMetadata, error) {
+func (s *MessagesServer) ListBackups() (map[string]BackupMetadata, error) {
 	files, err := ioutil.ReadDir(s.workDir)
 	if err != nil {
 		return nil, errors.Wrapf(err, "cannot list workdir %q backup filenames", s.workDir)
 	}
 
-	backups := make(map[string]pb.BackupMetadata)
+	backups := make(map[string]BackupMetadata)
 	for _, file := range files {
 		if !strings.HasSuffix(file.Name(), ".json") {
 			continue
@@ -353,7 +353,7 @@ func (s *MessagesServer) ListBackups() (map[string]pb.BackupMetadata, error) {
 		if err != nil {
 			return nil, fmt.Errorf("Invalid backup metadata file %s: %s", filename, err)
 		}
-		backups[file.Name()] = *bm.Metadata()
+		backups[file.Name()] = *bm
 	}
 
 	return backups, nil
@@ -408,12 +408,12 @@ func (s *MessagesServer) RestoreBackupFromMetadataFile(filename, storageName str
 		return fmt.Errorf("Invalid backup metadata file %s: %s", filename, err)
 	}
 
-	return s.RestoreBackUp(bm.Metadata(), storageName, skipUsersAndRoles)
+	return s.RestoreBackUp(bm, storageName, skipUsersAndRoles)
 }
 
 // RestoreBackUp will run a restore on each client, using the provided backup metadata to choose the source for each
 // replicaset.
-func (s *MessagesServer) RestoreBackUp(bm *pb.BackupMetadata, storageName string, skipUsersAndRoles bool) error {
+func (s *MessagesServer) RestoreBackUp(bm *BackupMetadata, storageName string, skipUsersAndRoles bool) error {
 	clients, err := s.RestoreSourcesByReplicaset(bm, storageName)
 	if err != nil {
 		return errors.Wrapf(err, "Cannot start backup restore. Cannot find backup source for replicas")
@@ -478,13 +478,14 @@ func (s *MessagesServer) StartBackup(opts *pb.StartBackup) error {
 		return fmt.Errorf("Cannot start a backup while a restore is still running")
 	}
 
+	// Prevent other backup to start during validations
+	s.reset()
+	s.setBackupRunning(true)
+	s.setOplogBackupRunning(true)
+
 	if err := s.ValidateReplicasetAgents(); err != nil {
 		return errors.Wrap(err, "cannot start a backup while not all MongoDB instances have a backup agent")
 	}
-
-	ext := getFileExtension(opts.CompressionType, opts.Cypher)
-
-	s.backupStatus.lastBackupMetadata = NewBackupMetadata(opts)
 
 	if err := s.RefreshClients(); err != nil {
 		return errors.Wrapf(err, "cannot refresh clients state for backup")
@@ -494,10 +495,11 @@ func (s *MessagesServer) StartBackup(opts *pb.StartBackup) error {
 	if err != nil {
 		return errors.Wrapf(err, "cannot start backup. Cannot find backup source for replicas")
 	}
-
-	s.reset()
-	s.setBackupRunning(true)
-	s.setOplogBackupRunning(true)
+	md, err := buildMetadata(opts, clients)
+	if err != nil {
+		return errors.Wrap(err, "cannot create the backup metadata")
+	}
+	s.backupStatus.lastBackupMetadata = md
 
 	for replName, client := range clients {
 		s.logger.Infof("Starting backup for replicaset %q on client %s %s %s",
@@ -510,32 +512,17 @@ func (s *MessagesServer) StartBackup(opts *pb.StartBackup) error {
 		if client.isPrimary {
 			s.logger.Warnf("Warning! Client %s is the primary", client.ID)
 		}
-
-		dbBackupName := fmt.Sprintf("%s_%s.dump%s", opts.NamePrefix, client.ReplicasetName, ext)
-		oplogBackupName := fmt.Sprintf("%s_%s.oplog%s", opts.NamePrefix, client.ReplicasetName, ext)
-
-		err := s.backupStatus.lastBackupMetadata.AddReplicaset(client.ClusterID,
-			client.ReplicasetName,
-			client.ReplicasetUUID,
-			dbBackupName,
-			oplogBackupName,
-		)
-		if err != nil {
-			return errors.Wrapf(err, "cannot add replicaset to metadata")
-		}
-
-		msg := &pb.StartBackup{
-			BackupType:      opts.GetBackupType(),
-			DbBackupName:    dbBackupName,
-			OplogBackupName: oplogBackupName,
-			CompressionType: opts.GetCompressionType(),
-			Cypher:          opts.GetCypher(),
-			OplogStartTime:  opts.GetOplogStartTime(),
-			Description:     opts.Description,
-			StorageName:     opts.GetStorageName(),
-		}
-		if err := client.startBackup(msg); err != nil {
-			return errors.Wrapf(err, "cannot start backup for client %s", client.ID)
+		if err := StartReplicasetBackup(md, replName, client); err != nil {
+			defer s.setBackupRunning(true)
+			defer s.setOplogBackupRunning(true)
+			if errc := s.cancelBackup(); errc != nil {
+				return errors.Wrapf(errc,
+					"cannot cancel the backup after failed backup start on client %s: %s",
+					client.ID,
+					err.Error(),
+				)
+			}
+			return errors.Wrapf(err, "cannot start the backup for client %s", client.ID)
 		}
 	}
 
@@ -543,6 +530,44 @@ func (s *MessagesServer) StartBackup(opts *pb.StartBackup) error {
 	waitOplogFinishChan := notify.Start(EventOplogFinish)
 	go s.waitOplogBackupToFinish(waitOplogFinishChan)
 
+	return nil
+}
+
+func buildMetadata(opts *pb.StartBackup, clients map[string]*Client) (*BackupMetadata, error) {
+	md := NewBackupMetadata(opts)
+	ext := getFileExtension(opts.CompressionType, opts.Cypher)
+
+	for replName, client := range clients {
+		dbBackupName := fmt.Sprintf("%s_%s.dump%s", opts.NamePrefix, client.ReplicasetName, ext)
+		oplogBackupName := fmt.Sprintf("%s_%s.oplog%s", opts.NamePrefix, client.ReplicasetName, ext)
+
+		err := md.AddReplicaset(client.ClusterID,
+			replName,
+			client.ReplicasetUUID,
+			dbBackupName,
+			oplogBackupName,
+		)
+		if err != nil {
+			return nil, errors.Wrapf(err, "cannot add replicaset to metadata")
+		}
+	}
+	return md, nil
+}
+
+func StartReplicasetBackup(md *BackupMetadata, rs string, client *Client) error {
+	msg := &pb.StartBackup{
+		BackupType:      md.GetBackupType(),              //opts.GetBackupType(),
+		DbBackupName:    md.Replicasets[rs].DbBackupName, //dbBackupName,
+		OplogBackupName: md.Replicasets[rs].OplogBackupName,
+		CompressionType: md.GetCompressionType(), //opts.GetCompressionType(),
+		Cypher:          md.GetCypher(),
+		OplogStartTime:  md.GetOplogStartTime(),
+		Description:     md.Description,
+		StorageName:     md.GetStorageName(),
+	}
+	if err := client.startBackup(msg); err != nil {
+		return errors.Wrapf(err, "cannot start backup for client %s", client.ID)
+	}
 	return nil
 }
 
@@ -930,8 +955,8 @@ func (s *MessagesServer) waitOplogBackupToFinish(c <-chan interface{}) {
 		// have access to the storage, but since we already have the client id for the last
 		// agent that completed the oplog backup, we are going to use it instead of searching
 		// for a random agent on the client's map
-		ts := time.Unix(s.backupStatus.lastBackupMetadata.metadata.StartTs, 0).UTC()
-		storage := s.backupStatus.lastBackupMetadata.metadata.StorageName
+		ts := time.Unix(s.backupStatus.lastBackupMetadata.StartTs, 0).UTC()
+		storage := s.backupStatus.lastBackupMetadata.StorageName
 		filename := fmt.Sprintf("%s.mdf", ts.Format(time.RFC3339))
 
 		if err := s.clients[clientID.(string)].storeFile(storage, filename, jsonMetadata); err != nil {

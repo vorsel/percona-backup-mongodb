@@ -82,7 +82,18 @@ func (a *Server) BackupsMetadata(m *pbapi.BackupsMetadataParams, stream pbapi.Ap
 		md := bmd[name]
 		msg := &pbapi.MetadataFile{
 			Filename: name,
-			Metadata: &md,
+			Metadata: &pb.BackupMetadata{
+				StartTs:         md.StartTs,
+				EndTs:           md.EndTs,
+				BackupType:      md.BackupType,
+				OplogStartTime:  md.OplogStartTime,
+				LastOplogTs:     md.LastOplogTs,
+				Cypher:          md.Cypher,
+				CompressionType: md.CompressionType,
+				Description:     md.Description,
+				Replicasets:     md.Replicasets,
+				StorageName:     md.StorageName,
+			},
 		}
 		if err := stream.Send(msg); err != nil {
 			return errors.Wrap(err, "cannot send MetadataFile through the stream")
@@ -95,7 +106,20 @@ func (a *Server) BackupsMetadata(m *pbapi.BackupsMetadataParams, stream pbapi.Ap
 // LastBackupMetadata returns the last backup metadata so it can be stored in the local filesystem as JSON
 func (a *Server) LastBackupMetadata(ctx context.Context, e *pbapi.LastBackupMetadataParams) (
 	*pb.BackupMetadata, error) {
-	return a.messagesServer.LastBackupMetadata().Metadata(), nil
+	smd := a.messagesServer.LastBackupMetadata()
+	md := &pb.BackupMetadata{
+		StartTs:         smd.StartTs,
+		EndTs:           smd.EndTs,
+		BackupType:      smd.BackupType,
+		OplogStartTime:  smd.OplogStartTime,
+		LastOplogTs:     smd.LastOplogTs,
+		Cypher:          smd.Cypher,
+		CompressionType: smd.CompressionType,
+		Description:     smd.Description,
+		Replicasets:     smd.Replicasets,
+		StorageName:     smd.StorageName,
+	}
+	return md, nil
 }
 
 // StartBackup starts a backup by calling server's StartBackup gRPC method
