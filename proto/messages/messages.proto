@@ -98,6 +98,11 @@ message CanRestoreBackup {
   string          storage_name     = 3;
 }
 
+message DeleteFile {
+   string storage_name = 1;
+   string filename     = 2;
+}
+
 message Error {
   string    message = 1;
   ErrorType code    = 2;
@@ -287,6 +292,7 @@ message ServerMessage {
     GetStorageInfo      get_storage_info_msg   = 16;
     ListStorages        list_storages_msg      = 17;
     StoreFile           store_file             = 18;
+    DeleteFile          delete_file            = 19;
   }
 }
 

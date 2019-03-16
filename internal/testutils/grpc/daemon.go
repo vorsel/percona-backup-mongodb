@@ -185,6 +185,9 @@ func (d *Daemon) Stop() {
 	defer d.lock.Unlock()
 
 	for _, client := range d.clients {
+		if client == nil {
+			continue
+		}
 		if err := client.Stop(); err != nil {
 			log.Errorf("Cannot stop client %s: %s", client.ID(), err)
 		}

@@ -44,7 +44,8 @@ type Client struct {
 	status     pb.Status
 }
 
-func newClient(id string, registerMsg *pb.Register, stream pb.Messages_MessagesChatServer, logger *logrus.Logger) *Client {
+func newClient(id string, registerMsg *pb.Register, stream pb.Messages_MessagesChatServer,
+	logger *logrus.Logger) *Client {
 	if logger == nil {
 		logger = logrus.New()
 		logger.SetLevel(logrus.StandardLogger().Level)
@@ -78,7 +79,8 @@ func newClient(id string, registerMsg *pb.Register, stream pb.Messages_MessagesC
 	return client
 }
 
-func (c *Client) CanRestoreBackup(backupType pb.BackupType, name, storageName string) (pb.CanRestoreBackupResponse, error) {
+func (c *Client) CanRestoreBackup(backupType pb.BackupType, name, storageName string) (
+	pb.CanRestoreBackupResponse, error) {
 	if err := c.streamSend(&pb.ServerMessage{
 		Payload: &pb.ServerMessage_CanRestoreBackupMsg{
 			CanRestoreBackupMsg: &pb.CanRestoreBackup{
@@ -98,7 +100,22 @@ func (c *Client) CanRestoreBackup(backupType pb.BackupType, name, storageName st
 		return *canRestoreBackupMsg, nil
 	}
 
-	return pb.CanRestoreBackupResponse{}, fmt.Errorf("Cannot get CanRestoreBackup Response (response is nil)")
+	return pb.CanRestoreBackupResponse{}, fmt.Errorf("cannot get CanRestoreBackup Response (response is nil)")
+}
+
+func (c *Client) DeleteFile(storageName, filename string) error {
+	msg := &pb.ServerMessage{
+		Payload: &pb.ServerMessage_DeleteFile{
+			DeleteFile: &pb.DeleteFile{
+				StorageName: storageName,
+				Filename:    filename,
+			},
+		},
+	}
+	if err := c.streamSend(msg); err != nil {
+		return errors.Wrapf(err, "cannot send delete file message to cient %s", c.ID)
+	}
+	return nil
 }
 
 func (c *Client) GetBackupSource() (string, error) {
@@ -112,7 +129,7 @@ func (c *Client) GetBackupSource() (string, error) {
 		return "", err
 	}
 	if errMsg := msg.GetErrorMsg(); errMsg != nil {
-		return "", fmt.Errorf("Cannot get backup source for client %s: %s", c.NodeName, errMsg)
+		return "", fmt.Errorf("cannot get backup source for client %s: %s", c.NodeName, errMsg)
 	}
 	return msg.GetBackupSourceMsg().GetSourceClient(), nil
 }

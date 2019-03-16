@@ -5,10 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"math/rand"
 	"os"
 	"path"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -26,6 +26,7 @@ import (
 	pb "github.com/percona/percona-backup-mongodb/proto/messages"
 	"github.com/percona/percona-backup-mongodb/storage"
 	"github.com/pkg/errors"
+	"github.com/schollz/progressbar"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -216,7 +217,10 @@ func TestGlobalWithDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Cannot start backup: %s", err)
 	}
+
+	log.Println("Waiting the DB backup to finish...")
 	d.MessagesServer.WaitBackupFinish()
+	log.Println("DB backup completed !")
 
 	/*
 		lastOplogDocRs1 has this structure:
@@ -261,7 +265,9 @@ func TestGlobalWithDaemon(t *testing.T) {
 	}
 
 	close(oplogGeneratorStopChan)
+	log.Println("Waiting the DB backup to finish...")
 	d.MessagesServer.WaitOplogBackupFinish()
+	log.Println("DB backup completed !")
 
 	// Test list backups
 	log.Debug("Testing backup metadata")
@@ -629,12 +635,20 @@ func TestClientDisconnect(t *testing.T) {
 		t.Fatalf("cannot start a new gRPC daemon/clients group: %s", err)
 	}
 	defer d.Stop()
-	defer testutils.CleanTempDirAndBucket()
-	d.StartAllAgents()
+	defer func() {
+		if err := testutils.CleanTempDirAndBucket(); err != nil {
+			t.Errorf("Cannot clean temporary testing dirs and buckets: %s", err)
+		}
+	}()
+	if err := d.StartAllAgents(); err != nil {
+		t.Fatalf("cannot start all agents: %s", err)
+	}
 
 	clientsCount1 := len(d.MessagesServer.Clients())
 	// Disconnect a client to check if the server detects the disconnection immediately
-	d.Clients()[0].Stop()
+	if err := d.Clients()[0].Stop(); err != nil {
+		t.Errorf("cannot stop a client to test disconnections: %s", err)
+	}
 
 	time.Sleep(2 * time.Second)
 
@@ -643,6 +657,213 @@ func TestClientDisconnect(t *testing.T) {
 	if clientsCount2 >= clientsCount1 {
 		t.Errorf("Invalid clients count. Want < %d, got %d", clientsCount1, clientsCount2)
 	}
+}
+
+func TestClientKill(t *testing.T) {
+	tmpDir, err := ioutil.TempDir("", "pbm_")
+	if err != nil {
+		t.Fatalf("Cannot create temporary directory for TestClientDisconnect: %s", err)
+	}
+	defer os.RemoveAll(tmpDir) // Clean up
+	log.Printf("Using %s as the temporary directory", tmpDir)
+
+	d, err := testGrpc.NewDaemon(context.Background(), tmpDir, testutils.TestingStorages(), t, nil)
+	if err != nil {
+		t.Fatalf("cannot start a new gRPC daemon/clients group: %s", err)
+	}
+	defer d.Stop()
+	defer func() {
+		if err := testutils.CleanTempDirAndBucket(); err != nil {
+			t.Errorf("Cannot cleanup temp dir and buckets: %s", err)
+		}
+	}()
+
+	if err := d.StartAllAgents(); err != nil {
+		t.Fatalf("Cannot start all agents: %s", err)
+	}
+
+	clientsCount1 := len(d.MessagesServer.Clients())
+
+	ndocs := 100000
+	oplogGeneratorStopChan := make(chan bool)
+	s1Session, err := mgo.DialWithInfo(testutils.PrimaryDialInfo(t, testutils.MongoDBShard1ReplsetName))
+	if err != nil {
+		log.Fatalf("Cannot connect to the DB: %s", err)
+	}
+	s1Session.SetMode(mgo.Strong, true)
+	log.Printf("Generating %d rows for rs1", ndocs)
+	generateDataToBackup(s1Session, ndocs)
+	log.Print("Data generation completed")
+	go generateOplogTraffic(s1Session, ndocs, oplogGeneratorStopChan)
+
+	// Also generate random data on shard 2
+	s2Session, err := mgo.DialWithInfo(testutils.PrimaryDialInfo(t, testutils.MongoDBShard2ReplsetName))
+	if err != nil {
+		log.Fatalf("Cannot connect to the DB: %s", err)
+	}
+	log.Printf("Generating %d rows for rs2", ndocs)
+	s2Session.SetMode(mgo.Strong, true)
+	generateDataToBackup(s2Session, ndocs)
+	log.Print("Data generation completed")
+	go generateOplogTraffic(s2Session, ndocs, oplogGeneratorStopChan)
+
+	backupNamePrefix := time.Now().UTC().Format(time.RFC3339)
+
+	storageName := "local-filesystem"
+
+	err = d.MessagesServer.StartBackup(&pb.StartBackup{
+		BackupType:      pb.BackupType_BACKUP_TYPE_LOGICAL,
+		CompressionType: pb.CompressionType_COMPRESSION_TYPE_NO_COMPRESSION,
+		Cypher:          pb.Cypher_CYPHER_NO_CYPHER,
+		OplogStartTime:  time.Now().UTC().Unix(),
+		NamePrefix:      backupNamePrefix,
+		Description:     "general_test_backup",
+		StorageName:     "local-filesystem",
+	})
+	if err != nil {
+		t.Fatalf("Cannot start backup: %s", err)
+	}
+	time.Sleep(2 * time.Second)
+	// Disconnect a client to check if the server detects the disconnection immediately
+	if err := d.Clients()[4].Stop(); err != nil {
+		t.Errorf("cannot stop test client: %s", err.Error())
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	runtime.GC()
+
+	clientsCount2 := len(d.MessagesServer.Clients())
+
+	if clientsCount2 >= clientsCount1 {
+		t.Errorf("Invalid clients count. Want < %d, got %d", clientsCount1, clientsCount2)
+	}
+
+	d.MessagesServer.WaitBackupFinish()
+
+	rs1OplogFile := path.Join(tmpDir, fmt.Sprintf("%s_rs1.oplog", backupNamePrefix))
+	rs1LastOplogDoc, err := getLastOplogDoc(rs1OplogFile)
+	if err != nil {
+		t.Fatalf("Cannot continue. Cannot open oplog dump for rs1: %s", err)
+	}
+	rs2OplogFile := path.Join(tmpDir, fmt.Sprintf("%s_rs2.oplog", backupNamePrefix))
+	rs2LastOplogDoc, err := getLastOplogDoc(rs2OplogFile)
+	if err != nil {
+		t.Fatalf("Cannot continue. Cannot open oplog dump for rs1: %s", err)
+	}
+
+	log.Info("Stopping the oplog tailer")
+	err = d.MessagesServer.StopOplogTail()
+	if err != nil {
+		t.Fatalf("Cannot stop the oplog tailer: %s", err)
+	}
+
+	close(oplogGeneratorStopChan)
+	d.MessagesServer.WaitOplogBackupFinish()
+
+	log.Info("Stopping the oplog tailer")
+	err = d.MessagesServer.StopOplogTail()
+	if err != nil {
+		t.Fatalf("Cannot stop the oplog tailer: %s", err)
+	}
+
+	// Test list backups
+	log.Debug("Testing backup metadata")
+	mdFilename := backupNamePrefix + ".json"
+	if err := d.MessagesServer.WriteBackupMetadata(mdFilename); err != nil {
+		t.Errorf("Cannot write backup metadata to file %q: %s", mdFilename, err.Error())
+	}
+
+	bms, err := d.MessagesServer.ListBackups()
+	if err != nil {
+		t.Errorf("Cannot get backups metadata listing: %s", err)
+	} else {
+		if bms == nil {
+			t.Errorf("Backups metadata listing is nil")
+		} else {
+			if len(bms) != 1 {
+				t.Errorf("Backups metadata listing is empty")
+			}
+			if _, ok := bms[mdFilename]; !ok {
+				t.Errorf("Backup metadata for %q doesn't exists", mdFilename)
+			}
+		}
+	}
+
+	cleanupDBForRestore(t, s1Session)
+	cleanupDBForRestore(t, s2Session)
+
+	log.Info("Starting restore test")
+	smd, err := d.APIServer.LastBackupMetadata(context.Background(), &pbapi.LastBackupMetadataParams{})
+	if err != nil {
+		t.Fatalf("Cannot get last backup metadata to start the restore process: %s", err)
+	}
+
+	md := &server.BackupMetadata{
+		BackupMetadata: pb.BackupMetadata{
+			StartTs:         smd.StartTs,
+			EndTs:           smd.EndTs,
+			BackupType:      smd.BackupType,
+			OplogStartTime:  smd.OplogStartTime,
+			LastOplogTs:     smd.LastOplogTs,
+			Cypher:          smd.Cypher,
+			CompressionType: smd.CompressionType,
+			Description:     smd.Description,
+			Replicasets:     smd.Replicasets,
+			StorageName:     smd.StorageName,
+		},
+	}
+	testRestoreWithMetadata(t, d, md, storageName)
+
+	type maxNumber struct {
+		Number int64 `bson:"number"`
+	}
+	var afterMaxS1, afterMaxS2 maxNumber
+	err = s1Session.DB(dbName).C(colName).Find(nil).Sort("-number").Limit(1).One(&afterMaxS1)
+	if err != nil {
+		log.Fatalf("Cannot get the max 'number' field in %s.%s: %s", dbName, colName, err)
+	}
+	fmt.Printf("after max s1: %+v\n", afterMaxS1)
+
+	err = s2Session.DB(dbName).C(colName).Find(nil).Sort("-number").Limit(1).One(&afterMaxS2)
+	if err != nil {
+		log.Fatalf("Cannot get the max 'number' field in %s.%s: %s", dbName, colName, err)
+	}
+	fmt.Printf("after max s2: %+v\n", afterMaxS2)
+
+	if afterMaxS1.Number < int64(rs1LastOplogDoc["o"].(bson.M)["number"].(int)) {
+		t.Errorf("Invalid documents count after restore is shard 1. Before restore: %d > after restore: %d",
+			rs1LastOplogDoc["o"].(bson.M)["number"].(int64),
+			afterMaxS1.Number,
+		)
+	}
+
+	if afterMaxS2.Number < int64(rs2LastOplogDoc["o"].(bson.M)["number"].(int)) {
+		t.Errorf("Invalid documents count after restore is shard 2. Before restore: %d > after restore: %d",
+			rs2LastOplogDoc["o"].(bson.M)["number"].(int64),
+			afterMaxS2.Number,
+		)
+	}
+
+	// we can compare lastOplogDocRsx o.number document because initially we have 100 rows in the table
+	// and the oplog generator is starting to count from 101 sequentially, so last inserted document = count
+	rs1BeforeCount := int64(rs1LastOplogDoc["o"].(bson.M)["number"].(int))
+	rs2BeforeCount := int64(rs2LastOplogDoc["o"].(bson.M)["number"].(int))
+	rs1AfterCount, err := s1Session.DB(dbName).C(colName).Find(nil).Count()
+	if err != nil {
+		t.Fatalf("Cannot get the docs count for rs1: %s", err.Error())
+	}
+	rs2AfterCount, err := s2Session.DB(dbName).C(colName).Find(nil).Count()
+	if err != nil {
+		t.Fatalf("Cannot get the docs count for rs2: %s", err.Error())
+	}
+
+	if int64(rs1AfterCount) < rs1BeforeCount {
+		t.Errorf("Invalid documents count in rs1. Want %d, got %d", rs1BeforeCount, rs1AfterCount)
+	}
+	if int64(rs2AfterCount) < rs2BeforeCount {
+		t.Errorf("Invalid documents count in rs2. Want %d, got %d", rs2BeforeCount, rs2AfterCount)
+	}
+
 }
 
 func TestListStorages(t *testing.T) {
@@ -1045,20 +1266,6 @@ func getLastOplogDocFromS3(svc *s3.S3, bucket, backupNamePrefix, replicaset stri
 	return doc, nil
 }
 
-func randomBucket() string {
-	rand.Seed(time.Now().UnixNano())
-	return fmt.Sprintf("pbm-test-bucket-%05d", rand.Int63n(99999))
-}
-
-func sortedReplicaNames(replicas map[string]*server.Client) []string {
-	a := []string{}
-	for key := range replicas {
-		a = append(a, key)
-	}
-	sort.Strings(a)
-	return a
-}
-
 func cleanupDBForRestore(t *testing.T, session *mgo.Session) {
 	err := session.DB(dbName).C(colName).DropCollection()
 	if err != nil {
@@ -1068,15 +1275,25 @@ func cleanupDBForRestore(t *testing.T, session *mgo.Session) {
 
 func generateDataToBackup(session *mgo.Session, ndocs int) {
 	// Don't check for error because the collection might not exist.
-	session.DB(dbName).C(colName).DropCollection()
-	session.DB(dbName).C(colName).EnsureIndexKey("number")
+	count, _ := session.DB(dbName).C(colName).Find(nil).Count()
+	if count >= ndocs {
+		return
+	}
+	if err := session.DB(dbName).C(colName).DropCollection(); err != nil {
+		log.Warnf("cannot drop collection %s.%s: %s", dbName, colName, err)
+	}
+	if err := session.DB(dbName).C(colName).EnsureIndexKey("number"); err != nil {
+		log.Warnf("cannot ensure 'number' index on %s.%s: %s", dbName, colName, err)
+	}
 	session.Refresh()
+	bar := progressbar.New(ndocs)
 
 	for i := 0; i < ndocs; i++ {
 		err := session.DB(dbName).C(colName).Insert(bson.M{"number": i})
 		if err != nil {
 			panic(errors.Wrap(err, "Cannot insert data to back up"))
 		}
+		_ = bar.Add(1)
 	}
 }
 
