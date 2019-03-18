@@ -57,7 +57,9 @@ type Client struct {
 	mgoDI           *mgo.DialInfo
 	isMasterDoc     *mdbstructs.IsMaster
 
-	storages       *storage.Storages
+	storages *storage.Storages
+
+	dumperLock     *sync.Mutex
 	mongoDumper    *dumper.Mongodump
 	oplogTailer    *oplog.OplogTail
 	logger         *logrus.Logger
@@ -163,8 +165,10 @@ func NewClient(inctx context.Context, in InputOptions) (*Client, error) {
 		// the event at the same moment we are sending the Ping response.
 		// Since the access to the stream is not thread safe, we need to synchronize the
 		// access to it with a mutex
+		storages: in.Storages,
+		//
 		streamLock: &sync.Mutex{},
-		storages:   in.Storages,
+		dumperLock: &sync.Mutex{},
 	}
 
 	return c, nil
@@ -356,7 +360,7 @@ func (c *Client) Stop() error {
 
 	c.running = false
 
-	c.cancelFunc()
+	//c.cancelFunc()
 	return c.stream.CloseSend()
 }
 
@@ -376,11 +380,13 @@ func (c *Client) processIncommingServerMessages() {
 	for {
 		msg, err := c.stream.Recv()
 		if err != nil { // Stream has been closed
+			if !c.isRunning() { // if the client has been stopped, don't try to reconnect
+				break
+			}
 			c.connect()
 			if err := c.register(); err != nil {
 				log.Errorf("cannot register client %s: %s", c.id, err.Error())
 			}
-			break
 		}
 
 		c.logger.Debugf("Incoming message: %+v", msg)
@@ -1180,9 +1186,11 @@ func (c *Client) runDBBackup(msg *pb.StartBackup) error {
 		Threads:  1,
 		Writer:   bw,
 	}
-	c.logger.Debugf("Calling Mongodump using: %+v", *mi)
+	c.logger.Debugf("Calling Mongodump using on client %s: %+v", c.id, *mi)
 
+	c.dumperLock.Lock()
 	c.mongoDumper, err = dumper.NewMongodump(mi)
+	c.dumperLock.Unlock()
 	if err != nil {
 		return err
 	}
@@ -1275,10 +1283,11 @@ func (c *Client) sendBackupFinishOK() {
 	if err != nil {
 		c.logger.Errorf("cannot get LastWrite.OpTime.Ts from MongoDB: %s", err)
 		finishMsg := &pb.DBBackupFinishStatus{
-			ClientId: c.id,
-			Ok:       false,
-			Ts:       0,
-			Error:    err.Error(),
+			ClientId:   c.id,
+			Replicaset: c.replicasetName,
+			Ok:         false,
+			Ts:         0,
+			Error:      err.Error(),
 		}
 		c.grpcClient.DBBackupFinished(context.Background(), finishMsg)
 		return

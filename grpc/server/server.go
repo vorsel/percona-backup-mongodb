@@ -6,7 +6,6 @@ import (
 	"io/ioutil"
 	"path/filepath"
 	"reflect"
-	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -37,9 +36,12 @@ type backupStatus struct {
 }
 
 type MessagesServer struct {
-	backupStatus backupStatus
 	lock         *sync.Mutex
+	backupStatus backupStatus
 	clients      map[string]*Client
+
+	mustrestartBackupLock *sync.Mutex
+	mustRestartBackup     bool
 
 	clientsRefreshInterval time.Duration
 	lastOplogTs            int64 // Timestamp in Unix format
@@ -108,8 +110,9 @@ func newMessagesServer(workDir string, logger *logrus.Logger) *MessagesServer {
 			replicasRunningBackup: make(map[string]bool),
 			lastBackupMetadata:    NewBackupMetadata(&pb.StartBackup{}),
 		},
-		workDir: workDir,
-		logger:  logger,
+		workDir:               workDir,
+		logger:                logger,
+		mustrestartBackupLock: &sync.Mutex{},
 	}
 	return messagesServer
 }
@@ -213,7 +216,8 @@ func (s *MessagesServer) BackupSourceByReplicaset() (map[string]*Client, error) 
 				s.logger.Errorf("Cannot get backup source for client %s: %s", client.NodeName, err)
 			}
 			if err != nil {
-				return nil, fmt.Errorf("Cannot get best client for replicaset %q: %s", client.ReplicasetName, err)
+				continue
+				//return nil, fmt.Errorf("Cannot get best client for replicaset %q: %s", client.ReplicasetName, err)
 			}
 			bestClient := s.getClientByNodeName(backupSource)
 			if bestClient == nil {
@@ -227,7 +231,6 @@ func (s *MessagesServer) BackupSourceByReplicaset() (map[string]*Client, error) 
 }
 
 func (s *MessagesServer) Clients() map[string]*Client {
-	debug.PrintStack()
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
@@ -635,10 +638,10 @@ func (s *MessagesServer) StopOplogTail() error {
 			client.isOplogTailerRunning(),
 		)
 		if client.isOplogTailerRunning() {
-			s.logger.Debugf("Stopping oplog tail in client %s at %s",
-				client.NodeName,
-				time.Unix(s.lastOplogTs, 0).Format(time.RFC3339),
-			)
+			// s.logger.Debugf("Stopping oplog tail in client %s at %s",
+			// 	client.NodeName,
+			// 	time.Unix(s.lastOplogTs, 0).Format(time.RFC3339),
+			// )
 			err := client.stopOplogTail(s.lastOplogTs)
 			if err != nil {
 				gErr = errors.Wrapf(gErr, "client: %s, error: %s", client.NodeName, err)
@@ -655,7 +658,8 @@ func (s *MessagesServer) StopOplogTail() error {
 
 func (s *MessagesServer) WaitBackupFinish() {
 	replicasets := s.ReplicasetsRunningDBBackup()
-	if len(replicasets) == 0 {
+
+	if !s.issetMustRestartBackup() && len(replicasets) == 0 {
 		return
 	}
 	<-s.dbBackupFinishChan
@@ -667,6 +671,12 @@ func (s *MessagesServer) WaitOplogBackupFinish() {
 		return
 	}
 	<-s.oplogBackupFinishChan
+}
+
+func (s *MessagesServer) issetMustRestartBackup() bool {
+	s.mustrestartBackupLock.Lock()
+	defer s.mustrestartBackupLock.Unlock()
+	return s.mustRestartBackup
 }
 
 func (s *MessagesServer) WaitRestoreFinish() {
@@ -701,75 +711,66 @@ func (s *MessagesServer) lastBackupFilesByReplicaset(rs string) (string, string,
 	return rsInfo.GetDbBackupName(), rsInfo.GetOplogBackupName(), nil
 }
 
+func (s *MessagesServer) restartBackup(rs string) error {
+	fmt.Printf("===Should restart the backup ? %v\n", s.shouldRestartBackup())
+	if s.shouldRestartBackup() { // always true until we add conditions
+		fmt.Println("MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM")
+		// dbBackupFile, oplogBackupFile, err := s.lastBackupFilesByReplicaset(client.ReplicasetName)
+		// if err != nil {
+		// 	fmt.Printf("s.lastBackupFilesByReplicaset error: %s\n", err)
+		// 	client.setDBBackupRunning(false)
+		// }
+		// storageName := s.backupStatus.lastBackupMetadata.StorageName
+		// if err := client.DeleteFile(storageName, dbBackupFile); err != nil {
+		// 	fmt.Printf("cannot delete file to restart the backup: %s\n", err)
+		// 	return nil, errors.Wrap(err, "cannot delete file to restart the backup")
+		// }
+		// if err := client.DeleteFile(storageName, oplogBackupFile); err != nil {
+		// 	fmt.Println("cannot delete file to restart the backup 2")
+		// 	return nil, errors.Wrap(err, "cannot delete file to restart the backup")
+		// }
+		clients, err := s.BackupSourceByReplicaset()
+		if err != nil {
+			fmt.Printf("cannot find a new client to restart the backup: %s", err)
+			return errors.Wrap(err, "cannot find a new client to restart the backup")
+		}
+		newClient, ok := clients[rs]
+		if !ok {
+			fmt.Printf("cannot restart the backup for RS %s. Cannot find a new client", rs)
+			return fmt.Errorf("cannot restart the backup for RS %s. Cannot find a new client", rs)
+		}
+
+		fmt.Println("==================================333333333333333333333333==========================================")
+		err = StartReplicasetBackup(s.backupStatus.lastBackupMetadata, rs, newClient)
+		if err != nil {
+			if errc := s.cancelBackup(); errc != nil {
+				return errors.Wrapf(errc,
+					"cannot cancel the backup after failed backup start on client %s", err)
+			}
+			return errors.Wrapf(err, "cannot start the backup for client ")
+		}
+	}
+
+	return nil
+}
+
 // DBBackupFinished process backup finished message from clients.
 // After the mongodump call finishes, clients should call this method to inform the event to the server
 func (s *MessagesServer) DBBackupFinished(ctx context.Context, msg *pb.DBBackupFinishStatus) (
 	*pb.DBBackupFinishedAck, error) {
-	//defer s.lock.Unlock()
-	fmt.Println("2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222")
-
 	client := s.getClientByID(msg.GetClientId())
 	if client == nil {
 		return nil, fmt.Errorf("Unknown client ID: %s", msg.GetClientId())
 	}
 
-	client.setDBBackupRunning(false)
-	//client.status.RunningDbBackup = false
-
-	// There was an error while running the backup?
-	// If so, delete partial backup files for that replicaset and restart the backup
-	// for that replicaset only
-	fmt.Printf("msg.GetOK %v\n", msg.GetOk())
 	if !msg.GetOk() {
-		fmt.Printf("===Should restart the backup ? %v\n", s.shouldRestartBackup())
-		if s.shouldRestartBackup() { // always true until we add conditions
-			dbBackupFile, oplogBackupFile, err := s.lastBackupFilesByReplicaset(client.ReplicasetName)
-			if err != nil {
-				fmt.Printf("s.lastBackupFilesByReplicaset error: %s\n", err)
-				client.setDBBackupRunning(false)
-			}
-			storageName := s.backupStatus.lastBackupMetadata.StorageName
-			if err := client.DeleteFile(storageName, dbBackupFile); err != nil {
-				fmt.Println("cannot delete file to restart the backup")
-				return nil, errors.Wrap(err, "cannot delete file to restart the backup")
-			}
-			if err := client.DeleteFile(storageName, oplogBackupFile); err != nil {
-				fmt.Println("cannot delete file to restart the backup 2")
-				return nil, errors.Wrap(err, "cannot delete file to restart the backup")
-			}
-			clients, err := s.BackupSourceByReplicaset()
-			if err != nil {
-				fmt.Printf("cannot find a new client to restart the backup: %s", err)
-				return nil, errors.Wrap(err, "cannot find a new client to restart the backup")
-			}
-			newClient, ok := clients[client.ReplicasetName]
-			if !ok {
-				fmt.Printf("cannot restart the backup for RS %s. Cannot find a new client",
-					client.ReplicasetName)
-				return nil, fmt.Errorf("cannot restart the backup for RS %s. Cannot find a new client",
-					client.ReplicasetName)
-			}
-
-			fmt.Println("==================================333333333333333333333333==========================================")
-			err = StartReplicasetBackup(s.backupStatus.lastBackupMetadata, client.ReplicasetName, newClient)
-			if err != nil {
-				if errc := s.cancelBackup(); errc != nil {
-					return nil, errors.Wrapf(errc,
-						"cannot cancel the backup after failed backup start on client %s: %s",
-						client.ID,
-						err.Error(),
-					)
-				}
-				return nil, errors.Wrapf(err, "cannot start the backup for client %s", client.ID)
-			}
-		}
+		s.lock.Lock()
 		s.backupStatus.lastBackupErrors = append(s.backupStatus.lastBackupErrors, errors.New(msg.GetError()))
+		s.lock.Unlock()
 	}
 
+	client.setDBBackupRunning(false)
 	replicasets := s.ReplicasetsRunningDBBackup()
-	fmt.Println("----------------------------------------------------------------------------------------------------")
-	fmt.Printf("Len replicasets: %d\n", len(replicasets))
-	fmt.Println("----------------------------------------------------------------------------------------------------")
 
 	if len(replicasets) == 0 {
 		if err := notify.Post(EventBackupFinish, time.Now()); err != nil {
@@ -794,7 +795,6 @@ func (s *MessagesServer) DBBackupFinished(ctx context.Context, msg *pb.DBBackupF
 	if lastOplogTs > s.lastOplogTs {
 		s.lastOplogTs = lastOplogTs
 	}
-	fmt.Println("===============555555555555555555555555555555555555555==============================================")
 	return &pb.DBBackupFinishedAck{}, nil
 }
 
@@ -836,7 +836,8 @@ func (s *MessagesServer) MessagesChat(stream pb.Messages_MessagesChatServer) err
 
 	clientID := msg.GetClientId()
 	s.logger.Debugf("Registering new client: %s", clientID)
-	if err := s.registerClient(stream, msg); err != nil {
+	client, err := s.registerClient(stream, msg)
+	if err != nil {
 		s.logger.Errorf("Cannot register client: %s", err)
 		r := &pb.ServerMessage{
 			Payload: &pb.ServerMessage_ErrorMsg{
@@ -854,6 +855,8 @@ func (s *MessagesServer) MessagesChat(stream pb.Messages_MessagesChatServer) err
 		return ClientAlreadyExistsError
 	}
 
+	//replicasetName := client.ReplicasetName
+
 	r := &pb.ServerMessage{
 		Payload: &pb.ServerMessage_AckMsg{AckMsg: &pb.Ack{}},
 	}
@@ -864,35 +867,36 @@ func (s *MessagesServer) MessagesChat(stream pb.Messages_MessagesChatServer) err
 
 	// Keep the stream open
 	<-stream.Context().Done()
+
+	log.Errorf("%s >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>", client.ID)
+
+	s.mustrestartBackupLock.Lock()
+	s.mustRestartBackup = client.isDBBackupRunning() || client.isOplogBackupRunning()
+	s.mustrestartBackupLock.Unlock()
+
+	log.Infof("client %s must restart the backup: %v. isDBBackupRunning: %v, isOplogBackupRunning: %v",
+		client.ID, s.issetMustRestartBackup(), client.isDBBackupRunning(), client.isOplogBackupRunning())
+
 	if err := s.unregisterClient(clientID); err != nil {
 		s.logger.Errorf("Client %s stream was closed but cannot unregister client: %s", clientID, err)
 	}
 
-	fmt.Println("====================================================================================================")
-	fmt.Printf("isDBBackupRunning: %v, isOplogBackupRunning: %v\n", s.isBackupRunning(), s.isOplogBackupRunning())
-	fmt.Println("====================================================================================================")
-	if !s.isBackupRunning() && !s.isOplogBackupRunning() {
+	if !s.issetMustRestartBackup() {
 		return nil
 	}
 
-	fmt.Println("IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII")
 	// Last client lost the connection.  If there was a backup running, choose another client
 	// (the first in the client's list) and send him the delete files message to remove the
 	// partially uploaded files.
-	for _, client := range s.clients {
-		clientID = client.ID
-		break
-	}
+	// for _, client := range s.clients {
+	// 	clientID = client.ID
+	// 	break
+	// }
 
-	bckFinishMsg := &pb.DBBackupFinishStatus{
-		ClientId: clientID,
-		Ok:       false,
-		Error:    fmt.Sprintf("lost connection with agent %s", clientID),
-	}
-
-	if _, err := s.DBBackupFinished(context.Background(), bckFinishMsg); err != nil {
-		return errors.Wrapf(err, "cannot signal backup error due to client %s disconnection", clientID)
-	}
+	// err = s.restartBackup(replicasetName)
+	// if err != nil {
+	// 	log.Errorf("cannot restart backup %s !!!!!!!!!!!!!!!!!!!!!!!!!!!!!1", err)
+	// }
 	return nil
 }
 
@@ -1108,30 +1112,30 @@ func (s *MessagesServer) isRestoreRunning() bool {
 	return s.backupStatus.restoreRunning
 }
 
-func (s *MessagesServer) registerClient(stream pb.Messages_MessagesChatServer, msg *pb.ClientMessage) error {
+func (s *MessagesServer) registerClient(stream pb.Messages_MessagesChatServer, msg *pb.ClientMessage) (*Client, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 	if msg.ClientId == "" {
-		return fmt.Errorf("Invalid client ID (empty)")
+		return nil, fmt.Errorf("Invalid client ID (empty)")
 	}
 
 	if client, exists := s.clients[msg.ClientId]; exists {
 		if err := client.ping(); err != nil {
 			delete(s.clients, msg.ClientId)
 		} else {
-			return ClientAlreadyExistsError
+			return nil, ClientAlreadyExistsError
 		}
 	}
 
 	regMsg := msg.GetRegisterMsg()
 	if regMsg == nil || regMsg.NodeType == pb.NodeType_NODE_TYPE_INVALID {
-		return fmt.Errorf("Node type in register payload cannot be empty")
+		return nil, fmt.Errorf("Node type in register payload cannot be empty")
 	}
 	s.logger.Debugf("Register msg: %+v", regMsg)
 	client := newClient(msg.ClientId, regMsg, stream, s.logger)
 	s.clients[msg.ClientId] = client
 
-	return nil
+	return client, nil
 }
 
 func (s *MessagesServer) reset() {

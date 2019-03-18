@@ -42,6 +42,9 @@ type Client struct {
 	stream     pb.Messages_MessagesChatServer
 	statusLock *sync.Mutex
 	status     pb.Status
+
+	isDBBackupRunningLock    *sync.Mutex
+	isOplogBackupRunningLock *sync.Mutex
 }
 
 func newClient(id string, registerMsg *pb.Register, stream pb.Messages_MessagesChatServer,
@@ -68,10 +71,12 @@ func newClient(id string, registerMsg *pb.Register, stream pb.Messages_MessagesC
 			RunningOplogBackup: false,
 			RestoreStatus:      pb.RestoreStatus_RESTORE_STATUS_NOT_RUNNING,
 		},
-		streamLock:     &sync.Mutex{},
-		statusLock:     &sync.Mutex{},
-		logger:         logger,
-		streamRecvChan: make(chan *pb.ClientMessage),
+		streamLock:               &sync.Mutex{},
+		statusLock:               &sync.Mutex{},
+		isDBBackupRunningLock:    &sync.Mutex{},
+		isOplogBackupRunningLock: &sync.Mutex{},
+		logger:                   logger,
+		streamRecvChan:           make(chan *pb.ClientMessage),
 	}
 
 	go client.handleStreamRecv()
@@ -371,8 +376,7 @@ func (c *Client) startBackup(opts *pb.StartBackup) error {
 	if err != nil {
 		return err
 	}
-	switch response.Payload.(type) {
-	case *pb.ClientMessage_AckMsg:
+	if _, ok := response.Payload.(*pb.ClientMessage_AckMsg); ok {
 		c.setDBBackupRunning(true)
 		c.setOplogTailerRunning(true)
 		return nil

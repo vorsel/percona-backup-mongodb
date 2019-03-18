@@ -38,7 +38,6 @@ type OplogTail struct {
 	startedReadChan chan bool
 	readFunc        func([]byte) (int, error)
 	lock            *sync.Mutex
-	isEOF           bool
 	running         bool
 }
 
@@ -159,19 +158,24 @@ func (ot *OplogTail) Count() uint64 {
 // Cancel stopts the tailer immediately without waiting the tailer to reach the
 // document having timestamp = IsMasterDoc().LastWrite.OpTime.Ts
 func (ot *OplogTail) Cancel() {
+	if !ot.isRunning() {
+		return
+	}
+	ot.setRunning(false)
 	close(ot.stopChan)
 	ot.wg.Wait()
 }
 
 func (ot *OplogTail) Close() error {
 	if !ot.isRunning() {
-		return fmt.Errorf("Tailer is already closed")
+		return fmt.Errorf("tailer is already closed")
 	}
 
 	ismaster, err := cluster.NewIsMaster(ot.session)
 	if err != nil {
+		ot.setRunning(false)
 		close(ot.stopChan)
-		return fmt.Errorf("Cannot get master doc LastWrite.Optime: %s", err)
+		return fmt.Errorf("cannot get master doc LastWrite.Optime: %s", err)
 	}
 
 	ot.lock.Lock()
@@ -185,7 +189,7 @@ func (ot *OplogTail) Close() error {
 
 func (ot *OplogTail) CloseAt(ts bson.MongoTimestamp) error {
 	if !ot.isRunning() {
-		return fmt.Errorf("Tailer is already closed")
+		return fmt.Errorf("tailer is already closed")
 	}
 
 	ot.lock.Lock()

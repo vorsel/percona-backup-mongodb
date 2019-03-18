@@ -137,7 +137,7 @@ func (md *Mongodump) Start() error {
 
 func (md *Mongodump) Stop() error {
 	if !md.isRunning() {
-		return fmt.Errorf("The dumper is not running")
+		return nil
 	}
 	md.mongodump.HandleInterrupt()
 	return md.Wait()
@@ -164,6 +164,9 @@ func (md *Mongodump) dump() {
 }
 
 func (md *Mongodump) isRunning() bool {
+	if md == nil {
+		return false
+	}
 	md.lock.Lock()
 	defer md.lock.Unlock()
 	return md.running
