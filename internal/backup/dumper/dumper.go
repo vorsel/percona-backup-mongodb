@@ -97,7 +97,9 @@ func NewMongodump(i *MongodumpInput) (*Mongodump, error) {
 	dump := &mongodump.MongoDump{
 		ToolOptions:   toolOpts,
 		OutputOptions: outputOpts,
-		InputOptions:  &mongodump.InputOptions{},
+		InputOptions: &mongodump.InputOptions{
+			ReadPreference: "secondaryPreferred",
+		},
 	}
 
 	if err := dump.ValidateOptions(); err != nil {
