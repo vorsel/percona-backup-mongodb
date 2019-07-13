@@ -198,6 +198,11 @@ message StopOplogTail {
   int64 ts = 1;
 }
 
+message CanceledBackup {
+  bool   ok  = 1;
+  string err = 2;
+}
+
 message ServerMessage {
   int32                 version                   = 1;
   oneof payload {
@@ -246,6 +251,7 @@ message ClientMessage {
     CmdLineOpts              cmd_line_opts          = 17;
     MongoDBVersion           mongodb_version        = 18;
     BalancerStatus           balancer_status        = 19;
+    CanceledBackup           canceled_backup        = 20;
   }
 }
 

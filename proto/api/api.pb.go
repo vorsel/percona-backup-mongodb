@@ -9,6 +9,8 @@ import (
 	proto "github.com/golang/protobuf/proto"
 	messages "github.com/percona/percona-backup-mongodb/proto/messages"
 	grpc "google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
+	status "google.golang.org/grpc/status"
 	math "math"
 )
 
@@ -1328,6 +1330,29 @@ type ApiServer interface {
 	BackupsMetadata(*BackupsMetadataParams, Api_BackupsMetadataServer) error
 	GetClients(*Empty, Api_GetClientsServer) error
 	ListStorages(*ListStoragesParams, Api_ListStoragesServer) error
+}
+
+// UnimplementedApiServer can be embedded to have forward compatible implementations.
+type UnimplementedApiServer struct {
+}
+
+func (*UnimplementedApiServer) RunBackup(ctx context.Context, req *RunBackupParams) (*RunBackupResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RunBackup not implemented")
+}
+func (*UnimplementedApiServer) RunRestore(ctx context.Context, req *RunRestoreParams) (*RunRestoreResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method RunRestore not implemented")
+}
+func (*UnimplementedApiServer) LastBackupMetadata(ctx context.Context, req *LastBackupMetadataParams) (*messages.BackupMetadata, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method LastBackupMetadata not implemented")
+}
+func (*UnimplementedApiServer) BackupsMetadata(req *BackupsMetadataParams, srv Api_BackupsMetadataServer) error {
+	return status.Errorf(codes.Unimplemented, "method BackupsMetadata not implemented")
+}
+func (*UnimplementedApiServer) GetClients(req *Empty, srv Api_GetClientsServer) error {
+	return status.Errorf(codes.Unimplemented, "method GetClients not implemented")
+}
+func (*UnimplementedApiServer) ListStorages(req *ListStoragesParams, srv Api_ListStoragesServer) error {
+	return status.Errorf(codes.Unimplemented, "method ListStorages not implemented")
 }
 
 func RegisterApiServer(s *grpc.Server, srv ApiServer) {
