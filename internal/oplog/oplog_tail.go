@@ -159,7 +159,12 @@ func (ot *OplogTail) Count() uint64 {
 // Cancel stopts the tailer immediately without waiting the tailer to reach the
 // document having timestamp = IsMasterDoc().LastWrite.OpTime.Ts
 func (ot *OplogTail) Cancel() {
-	close(ot.stopChan)
+	if ot == nil {
+		return
+	}
+	if ot.stopChan != nil {
+		close(ot.stopChan)
+	}
 	ot.wg.Wait()
 }
 

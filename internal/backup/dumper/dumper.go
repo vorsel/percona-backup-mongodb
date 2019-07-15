@@ -129,27 +129,37 @@ func (md *Mongodump) Start() error {
 	if err := md.mongodump.Init(); err != nil {
 		return errors.Wrapf(err, "cannot start mongodump")
 	}
-	md.setRunning(true)
 	go md.dump()
 
 	return nil
 }
 
 func (md *Mongodump) Stop() error {
-	if !md.isRunning() {
-		return fmt.Errorf("The dumper is not running")
+	if md == nil { // backup not started
+		return nil
 	}
+
+	md.lock.Lock()
+	defer md.lock.Unlock()
+
+	//if !md.isRunning() {
+	//	return fmt.Errorf("The dumper is not running")
+	//}
+	if md.mongodump == nil {
+		return nil
+	}
+
 	md.mongodump.HandleInterrupt()
 	return md.Wait()
 }
 
 func (md *Mongodump) Wait() error {
-	if !md.isRunning() {
-		return fmt.Errorf("The dumper is not running")
-	}
-	md.setRunning(false)
+	//if !md.isRunning() {
+	//	return nil
+	//}
 	defer close(md.waitChan)
 	md.lastError = <-md.waitChan
+	md.setRunning(false)
 	return md.lastError
 }
 
@@ -158,7 +168,9 @@ func (md *Mongodump) dump() {
 	md.mongodump.ProgressManager = progressManager
 	progressManager.Start()
 	defer progressManager.Stop()
+	md.mongodump.Init()
 
+	md.setRunning(true)
 	err := md.mongodump.Dump()
 	md.waitChan <- err
 }

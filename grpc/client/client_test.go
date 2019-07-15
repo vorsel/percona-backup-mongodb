@@ -7,6 +7,7 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/globalsign/mgo"
 	"github.com/globalsign/mgo/bson"
@@ -202,6 +203,59 @@ func testBackupAndRestore(t *testing.T, storage string) {
 	}
 
 	err = c.restoreDBDump(rmsg)
+	if err != nil {
+		t.Errorf("Cannot process restore from s3: %s", err)
+	}
+
+}
+
+func TestCancelBackup(t *testing.T) {
+	// ndocs := 1_000_000
+	// bulkSize := 5000
+	storage := "local-filesystem"
+
+	input, err := buildInputParams()
+	if err != nil {
+		t.Fatalf("Cannot build agent's input params: %s", err)
+	}
+
+	c, err := NewClient(context.TODO(), input)
+	if err != nil {
+		t.Fatalf("Cannot get S3 storage: %s", err)
+	}
+	if err := c.dbConnect(); err != nil {
+		t.Fatalf("Cannot connect to the db: %s", err)
+	}
+
+	session, err := mgo.DialWithInfo(testutils.PrimaryDialInfo(t, testutils.MongoDBShard1ReplsetName))
+	if err != nil {
+		log.Fatalf("Cannot connect to the DB: %s", err)
+	}
+
+	session.SetMode(mgo.Strong, true)
+
+	// generateDataToBackup(t, c.mgoSession, dbName, col1, ndocs, bulkSize)
+	// generateDataToBackup(t, c.mgoSession, dbName, col2, ndocs, bulkSize)
+	//defer dropCollections(t, c.mgoSession, dbName, col1, col2)
+
+	msg := &pb.StartBackup{
+		BackupType:      pb.BackupType_BACKUP_TYPE_LOGICAL,
+		DbBackupName:    "0001.dump",
+		OplogBackupName: "",
+		CompressionType: pb.CompressionType_COMPRESSION_TYPE_NO_COMPRESSION,
+		Cypher:          pb.Cypher_CYPHER_NO_CYPHER,
+		OplogStartTime:  0,
+		Description:     "test001",
+		StorageName:     storage,
+		MongodbVersion:  "3.6.0",
+	}
+
+	go func() {
+		time.Sleep(5 * time.Second)
+		err = c.processCancelBackup()
+		fmt.Println(err)
+	}()
+	err = c.runDBBackup(msg)
 	if err != nil {
 		t.Errorf("Cannot process restore from s3: %s", err)
 	}

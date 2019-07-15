@@ -66,6 +66,7 @@ type Client struct {
 	isMasterDoc *mdbstructs.IsMaster
 
 	storages         *storage.Storages
+	mdLock           *sync.Mutex
 	mongoDumper      *dumper.Mongodump
 	oplogTailer      *oplog.OplogTail
 	logger           *logrus.Logger
@@ -213,6 +214,7 @@ func NewClient(inctx context.Context, in InputOptions) (*Client, error) {
 		// access to it with a mutex
 		streamLock: &sync.Mutex{},
 		storages:   in.Storages,
+		mdLock:     &sync.Mutex{},
 	}
 
 	return c, nil
@@ -578,8 +580,11 @@ func (c *Client) dbReconnect() {
 }
 
 func (c *Client) processCancelBackup() error {
+	fmt.Println("====================================================================================================")
+	c.mdLock.Lock()
+	defer c.mdLock.Unlock()
 	err := c.mongoDumper.Stop()
-	c.oplogTailer.Cancel()
+	//c.oplogTailer.Cancel()
 	return err
 }
 
@@ -1462,10 +1467,13 @@ func (c *Client) runDBBackup(msg *pb.StartBackup) error {
 		Writer:   bw,
 	}
 
+	c.mdLock.Lock()
 	c.mongoDumper, err = dumper.NewMongodump(mi)
 	if err != nil {
+		c.mdLock.Unlock()
 		return err
 	}
+	c.mdLock.Unlock()
 
 	c.setDBBackupRunning(true)
 	defer c.setDBBackupRunning(false)
@@ -1474,6 +1482,7 @@ func (c *Client) runDBBackup(msg *pb.StartBackup) error {
 		return errors.Wrap(err, "Cannot start the backup")
 	}
 
+	time.Sleep(2 * time.Second)
 	derr := c.mongoDumper.Wait()
 	if err = bw.Close(); err != nil {
 		return err
