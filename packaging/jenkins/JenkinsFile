@@ -20,6 +20,7 @@ pipeline {
             steps {
                 sh '\'ip addr\''
             }
+        }
         stage("Third step") {
             steps {
                 sh '\'uname -a\''
