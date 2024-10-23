@@ -148,6 +148,11 @@ install_golang() {
     ln -s /usr/local/go1.22 /usr/local/go
 }
 
+switch_to_vault_repo() {
+    sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-*
+    sed -i 's|#\s*baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*
+}
+
 install_deps() {
     if [ $INSTALL = 0 ]; then
         echo "Dependencies will not be installed"
@@ -162,6 +167,9 @@ install_deps() {
     if [ "x$OS" = "xrpm" ]; then
         RHEL=$(rpm --eval %rhel)
         yum clean all
+       if [ "x$RHEL" = "x7" ]; then
+            switch_to_vault_repo
+       fi
         yum -y install epel-release git wget
         yum -y install rpm-build make rpmlint rpmdevtools golang krb5-devel
         install_golang
