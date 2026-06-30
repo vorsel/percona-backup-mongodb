@@ -120,6 +120,7 @@ type PhysRestore struct {
 
 	stopHB        chan struct{}
 	stopCleanupHB chan struct{}
+	hbWG          sync.WaitGroup
 
 	log     log.LogEvent
 	logBuff *logBuff
@@ -212,6 +213,16 @@ func NewPhysical(
 	}, nil
 }
 
+func (r *PhysRestore) closeStoragesAfterHeartbeats() {
+	r.hbWG.Wait()
+
+	storage.Close(r.bcpStg, r.log)
+	r.bcpStg = nil
+
+	storage.Close(r.stg, r.log)
+	r.stg = nil
+}
+
 // peeks a random free port in a range [minPort, maxPort]
 func peekTmpPort(current int) (int, error) {
 	const (
@@ -278,6 +289,7 @@ func (r *PhysRestore) close(noerr bool, progress nodeStatus) (err error) {
 		if r.stopCleanupHB != nil {
 			close(r.stopCleanupHB)
 		}
+		r.closeStoragesAfterHeartbeats()
 	}()
 
 	// resolve and exec cleanup
@@ -2462,9 +2474,11 @@ func (r *PhysRestore) startHB(l log.LogEvent) {
 	}
 
 	r.stopHB = make(chan struct{})
+	r.hbWG.Add(1)
 	go func() {
 		tk := time.NewTicker(time.Second * hbFrameSec)
 		defer func() {
+			r.hbWG.Done()
 			tk.Stop()
 			r.stopHB = nil
 			l.Debug("heartbeats stopped")
@@ -2525,9 +2539,11 @@ func (r *PhysRestore) startCleanupHb() {
 	}
 
 	r.stopCleanupHB = make(chan struct{})
+	r.hbWG.Add(1)
 	go func() {
 		tk := time.NewTicker(hbCleanupFrame)
 		defer func() {
+			r.hbWG.Done()
 			tk.Stop()
 			r.stopCleanupHB = nil
 			r.log.Debug("cleanup heartbeats stopped")
@@ -3175,6 +3191,7 @@ func PhysRestoreFinish(l log.LogEvent, cmd *ExtFinishCmd) error {
 		if r.stopHB != nil {
 			close(r.stopHB)
 		}
+		r.closeStoragesAfterHeartbeats()
 	}()
 
 	excfg, err := r.prepareExtRestore(l)
@@ -3254,6 +3271,12 @@ func physRestoreFromExtDump(
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "get storage")
 	}
+	closeStorage := true
+	defer func() {
+		if closeStorage {
+			storage.Close(stg, l)
+		}
+	}()
 
 	extDumpF := fmt.Sprintf("%s/%s/rs.%s/node.%s.%s",
 		defs.PhysRestoresDir, cmd.RestoreName, cmd.RS, cmd.Node, extDumpSuffix)
@@ -3308,6 +3331,7 @@ func physRestoreFromExtDump(
 		physRestore.secOpts = mongodCfg.Security
 	}
 
+	closeStorage = false
 	return &physRestore, restoreMeta, nil
 }
 
