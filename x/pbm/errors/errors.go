@@ -30,7 +30,7 @@ func Is(cause, target error) bool {
 	return gerrs.Is(cause, target)
 }
 
-func As(cause error, target interface{}) bool {
+func As(cause error, target any) bool {
 	return gerrs.As(cause, target)
 }
 

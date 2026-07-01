@@ -16,6 +16,7 @@ require (
 	go.etcd.io/etcd/server/v3 v3.6.12
 	go.mongodb.org/mongo-driver/v2 v2.7.0
 	golang.org/x/mod v0.37.0
+	gopkg.in/yaml.v2 v2.4.0
 )
 
 require (
