@@ -34,16 +34,12 @@ type Config struct {
 
 //nolint:lll
 type Credentials struct {
-	// Workload Identity Federation (allows missing JSON/HMAC credentials)
+	// Workload Identity Federation (allows missing service account credentials)
 	WorkloadIdentity bool `bson:"workloadIdentity,omitempty" json:"workloadIdentity,omitempty" yaml:"workloadIdentity,omitempty"`
 
-	// JSON credentials (service account)
+	// Service account credentials.
 	ClientEmail storage.MaskedString `bson:"clientEmail" json:"clientEmail,omitempty" yaml:"clientEmail,omitempty"`
 	PrivateKey  storage.MaskedString `bson:"privateKey" json:"privateKey,omitempty" yaml:"privateKey,omitempty"`
-
-	// HMAC credentials for XML API (S3 compatibility)
-	HMACAccessKey storage.MaskedString `bson:"hmacAccessKey" json:"hmacAccessKey,omitempty" yaml:"hmacAccessKey,omitempty"`
-	HMACSecret    storage.MaskedString `bson:"hmacSecret" json:"hmacSecret,omitempty" yaml:"hmacSecret,omitempty"`
 }
 
 //nolint:lll

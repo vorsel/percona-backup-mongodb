@@ -12,8 +12,6 @@ import (
 )
 
 const (
-	gcsEndpointURL = "storage.googleapis.com"
-
 	defaultChunkSize               = 10 * 1024 * 1024 // 10MiB
 	defaultParallelUploadChunkSize = 16 * 1024 * 1024 // 16MiB, matches Google SDK PCU default
 	defaultMaxObjSizeGB            = 5018             // 4.9 TB
@@ -36,20 +34,11 @@ type ServiceAccountCredentials struct {
 	ClientCertURL       string `json:"client_x509_cert_url"`
 }
 
-type gcsClient interface {
-	save(name string, data io.Reader, options ...storage.Option) error
-	fileStat(name string) (storage.FileInfo, error)
-	list(prefix, suffix string) ([]storage.FileInfo, error)
-	delete(name string) error
-	copy(src, dst string) error
-	getPartialObject(name string, buf *storage.Arena, start, length int64) (io.ReadCloser, error)
-}
-
 type GCS struct {
 	cfg *Config
 	log log.LogEvent
 
-	client gcsClient
+	client *googleClient
 	d      *Download
 }
 
@@ -63,19 +52,11 @@ func New(cfg *Config, node string, l log.LogEvent) (storage.Storage, error) {
 		log: l,
 	}
 
-	if g.cfg.Credentials.HMACAccessKey != "" && g.cfg.Credentials.HMACSecret != "" {
-		hc, err := newHMACClient(g.cfg, g.log)
-		if err != nil {
-			return nil, errors.Wrap(err, "new hmac client")
-		}
-		g.client = hc
-	} else {
-		gc, err := newGoogleClient(g.cfg, g.log)
-		if err != nil {
-			return nil, errors.Wrap(err, "new google client")
-		}
-		g.client = gc
+	gc, err := newGoogleClient(g.cfg, g.log)
+	if err != nil {
+		return nil, errors.Wrap(err, "new google client")
 	}
+	g.client = gc
 
 	g.d = &Download{
 		arenas:   []*storage.Arena{storage.NewArena(storage.DownloadChuckSizeDefault, storage.DownloadChuckSizeDefault)},
@@ -105,19 +86,11 @@ func NewWithDownloader(
 		log: l,
 	}
 
-	if g.cfg.Credentials.HMACAccessKey != "" && g.cfg.Credentials.HMACSecret != "" {
-		hc, err := newHMACClient(g.cfg, g.log)
-		if err != nil {
-			return nil, errors.Wrap(err, "new hmac client")
-		}
-		g.client = hc
-	} else {
-		gc, err := newGoogleClient(g.cfg, g.log)
-		if err != nil {
-			return nil, errors.Wrap(err, "new google client")
-		}
-		g.client = gc
+	gc, err := newGoogleClient(g.cfg, g.log)
+	if err != nil {
+		return nil, errors.Wrap(err, "new google client")
 	}
+	g.client = gc
 
 	arenaSize, spanSize, cc := storage.DownloadOpts(cc, bufSizeMb, spanSizeMb)
 	g.log.Debug("download max buf %d (arena %d, span %d, concurrency %d)", arenaSize*cc, arenaSize, spanSize, cc)
@@ -172,10 +145,5 @@ func (g *GCS) Close() error {
 		return nil
 	}
 
-	c, ok := g.client.(storage.Closable)
-	if !ok {
-		return nil
-	}
-
-	return c.Close()
+	return g.client.Close()
 }
