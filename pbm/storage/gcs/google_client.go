@@ -16,25 +16,18 @@ import (
 	"google.golang.org/api/option"
 
 	"github.com/percona/percona-backup-mongodb/pbm/errors"
-	"github.com/percona/percona-backup-mongodb/pbm/log"
 	"github.com/percona/percona-backup-mongodb/pbm/storage"
 )
 
-type googleClient struct {
-	client       *storagegcs.Client
-	bucketHandle *storagegcs.BucketHandle
-	cfg          *Config
-	log          log.LogEvent
-}
-
-func newGoogleClient(cfg *Config, l log.LogEvent) (*googleClient, error) {
+func (g *GCS) initClient() error {
 	ctx := context.Background()
 	var cli *storagegcs.Client
 	var err error
+	cfg := g.cfg
 
 	if !cfg.Credentials.WorkloadIdentity && (cfg.Credentials.PrivateKey == "" || cfg.Credentials.ClientEmail == "") {
 		errMsg := "clientEmail and privateKey are required for GCS credentials when workloadIdentity is not enabled"
-		return nil, errors.New(errMsg)
+		return errors.New(errMsg)
 	}
 
 	if cfg.Credentials.PrivateKey != "" && cfg.Credentials.ClientEmail != "" {
@@ -52,7 +45,7 @@ func newGoogleClient(cfg *Config, l log.LogEvent) (*googleClient, error) {
 			),
 		})
 		if merr != nil {
-			return nil, errors.Wrap(merr, "marshal GCS credentials")
+			return errors.Wrap(merr, "marshal GCS credentials")
 		}
 		if cfg.ClientType == ClientTypeGRPC {
 			cli, err = storagegcs.NewGRPCClient(ctx,
@@ -66,11 +59,11 @@ func newGoogleClient(cfg *Config, l log.LogEvent) (*googleClient, error) {
 		// We only check the credentials type, the scoped used hear doesn't really matter
 		adc, adcErr := google.FindDefaultCredentials(ctx, storagegcs.ScopeReadOnly)
 		if adcErr != nil {
-			return nil, fmt.Errorf("finding default credentials: %w", adcErr)
+			return fmt.Errorf("finding default credentials: %w", adcErr)
 		}
 		adcErr = validateDefaultCredentialType(adc)
 		if adcErr != nil {
-			return nil, fmt.Errorf("validate default credential type: %w", adcErr)
+			return fmt.Errorf("validate default credential type: %w", adcErr)
 		}
 		if cfg.ClientType == ClientTypeGRPC {
 			cli, err = storagegcs.NewGRPCClient(ctx, storagegcs.WithDisabledClientMetrics())
@@ -80,7 +73,7 @@ func newGoogleClient(cfg *Config, l log.LogEvent) (*googleClient, error) {
 	}
 
 	if err != nil {
-		return nil, errors.Wrap(err, "new GCS client")
+		return errors.Wrap(err, "new GCS client")
 	}
 
 	cli.SetRetry(
@@ -94,28 +87,9 @@ func newGoogleClient(cfg *Config, l log.LogEvent) (*googleClient, error) {
 		storagegcs.WithErrorFunc(shouldRetryExtended),
 	)
 
-	bh := cli.Bucket(cfg.Bucket)
-
-	return &googleClient{
-		client:       cli,
-		bucketHandle: bh,
-		cfg:          cfg,
-		log:          l,
-	}, nil
-}
-
-func (g googleClient) Close() error {
-	if g.client == nil {
-		return nil
-	}
-
-	if g.cfg.parallelUploadEnabled() {
-		// Google SDK parallel upload starts temporary object cleanup asynchronously
-		// after Writer.Close returns. Give it a short window before closing the client.
-		time.Sleep(2 * time.Second)
-	}
-
-	return g.client.Close()
+	g.client = cli
+	g.bucketHandle = cli.Bucket(cfg.Bucket)
+	return nil
 }
 
 // validateDefaultCredentialType validates that credentials are of type "external_account" used for Workload Identity
@@ -156,7 +130,7 @@ func shouldRetryExtended(err error) bool {
 	return false
 }
 
-func (g googleClient) save(name string, data io.Reader, options ...storage.Option) error {
+func (g *GCS) save(name string, data io.Reader, options ...storage.Option) error {
 	opts := storage.GetDefaultOpts()
 	for _, opt := range options {
 		if err := opt(opts); err != nil {
@@ -228,7 +202,7 @@ func (g googleClient) save(name string, data io.Reader, options ...storage.Optio
 	return nil
 }
 
-func (g googleClient) fileStat(name string) (storage.FileInfo, error) {
+func (g *GCS) fileStat(name string) (storage.FileInfo, error) {
 	ctx := context.Background()
 
 	attrs, err := g.bucketHandle.Object(path.Join(g.cfg.Prefix, name)).Attrs(ctx)
@@ -252,7 +226,7 @@ func (g googleClient) fileStat(name string) (storage.FileInfo, error) {
 	return inf, nil
 }
 
-func (g googleClient) list(prefix, suffix string) ([]storage.FileInfo, error) {
+func (g *GCS) list(prefix, suffix string) ([]storage.FileInfo, error) {
 	ctx := context.Background()
 
 	var files []storage.FileInfo
@@ -291,7 +265,7 @@ func (g googleClient) list(prefix, suffix string) ([]storage.FileInfo, error) {
 	return files, nil
 }
 
-func (g googleClient) delete(name string) error {
+func (g *GCS) delete(name string) error {
 	ctx := context.Background()
 
 	err := g.bucketHandle.Object(path.Join(g.cfg.Prefix, name)).Delete(ctx)
@@ -305,7 +279,7 @@ func (g googleClient) delete(name string) error {
 	return nil
 }
 
-func (g googleClient) copy(src, dst string) error {
+func (g *GCS) copy(src, dst string) error {
 	ctx := context.Background()
 
 	srcObj := g.bucketHandle.Object(path.Join(g.cfg.Prefix, src))
@@ -320,7 +294,7 @@ func (g googleClient) copy(src, dst string) error {
 	return err
 }
 
-func (g googleClient) getPartialObject(name string, buf *storage.Arena, start, length int64) (io.ReadCloser, error) {
+func (g *GCS) getPartialObject(name string, buf *storage.Arena, start, length int64) (io.ReadCloser, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
 	defer cancel()
 

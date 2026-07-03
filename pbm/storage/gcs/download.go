@@ -40,10 +40,10 @@ func (g *GCS) newPartReader(fname string, fsize int64, chunkSize int) *storage.P
 		Buf:       make([]byte, 32*1024),
 		L:         g.log,
 		GetChunk: func(fname string, arena *storage.Arena, cli interface{}, start, end int64) (io.ReadCloser, error) {
-			return cli.(*googleClient).getPartialObject(fname, arena, start, end-start+1)
+			return cli.(*GCS).getPartialObject(fname, arena, start, end-start+1)
 		},
 		GetSess: func() (interface{}, error) {
-			return g.client, nil // re-use the already-initialized client
+			return g, nil
 		},
 	}
 }

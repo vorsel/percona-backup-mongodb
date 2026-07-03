@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	storagegcs "cloud.google.com/go/storage"
+
 	"github.com/percona/percona-backup-mongodb/pbm/errors"
 	"github.com/percona/percona-backup-mongodb/pbm/log"
 	"github.com/percona/percona-backup-mongodb/pbm/storage"
@@ -38,8 +40,9 @@ type GCS struct {
 	cfg *Config
 	log log.LogEvent
 
-	client *googleClient
-	d      *Download
+	client       *storagegcs.Client
+	bucketHandle *storagegcs.BucketHandle
+	d            *Download
 }
 
 func New(cfg *Config, node string, l log.LogEvent) (storage.Storage, error) {
@@ -52,11 +55,9 @@ func New(cfg *Config, node string, l log.LogEvent) (storage.Storage, error) {
 		log: l,
 	}
 
-	gc, err := newGoogleClient(g.cfg, g.log)
-	if err != nil {
+	if err := g.initClient(); err != nil {
 		return nil, errors.Wrap(err, "new google client")
 	}
-	g.client = gc
 
 	g.d = &Download{
 		arenas:   []*storage.Arena{storage.NewArena(storage.DownloadChuckSizeDefault, storage.DownloadChuckSizeDefault)},
@@ -86,11 +87,9 @@ func NewWithDownloader(
 		log: l,
 	}
 
-	gc, err := newGoogleClient(g.cfg, g.log)
-	if err != nil {
+	if err := g.initClient(); err != nil {
 		return nil, errors.Wrap(err, "new google client")
 	}
-	g.client = gc
 
 	arenaSize, spanSize, cc := storage.DownloadOpts(cc, bufSizeMb, spanSizeMb)
 	g.log.Debug("download max buf %d (arena %d, span %d, concurrency %d)", arenaSize*cc, arenaSize, spanSize, cc)
@@ -115,11 +114,11 @@ func (*GCS) Type() storage.Type {
 }
 
 func (g *GCS) Save(name string, data io.Reader, options ...storage.Option) error {
-	return g.client.save(name, data, options...)
+	return g.save(name, data, options...)
 }
 
 func (g *GCS) FileStat(name string) (storage.FileInfo, error) {
-	return g.client.fileStat(name)
+	return g.fileStat(name)
 }
 
 func (g *GCS) List(prefix, suffix string) ([]storage.FileInfo, error) {
@@ -129,20 +128,26 @@ func (g *GCS) List(prefix, suffix string) ([]storage.FileInfo, error) {
 		prfx += "/"
 	}
 
-	return g.client.list(prfx, suffix)
+	return g.list(prfx, suffix)
 }
 
 func (g *GCS) Delete(name string) error {
-	return g.client.delete(name)
+	return g.delete(name)
 }
 
 func (g *GCS) Copy(src, dst string) error {
-	return g.client.copy(src, dst)
+	return g.copy(src, dst)
 }
 
 func (g *GCS) Close() error {
 	if g == nil || g.client == nil {
 		return nil
+	}
+
+	if g.cfg.parallelUploadEnabled() {
+		// Google SDK parallel upload starts temporary object cleanup asynchronously
+		// after Writer.Close returns. Give it a short window before closing the client.
+		time.Sleep(2 * time.Second)
 	}
 
 	return g.client.Close()
