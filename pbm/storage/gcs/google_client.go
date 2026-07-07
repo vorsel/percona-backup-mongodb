@@ -16,57 +16,20 @@ import (
 
 func (g *GCS) initClient() error {
 	ctx := context.Background()
-	var cli *storagegcs.Client
-	var err error
 	cfg := g.cfg
 
-	if !cfg.Credentials.WorkloadIdentity && (cfg.Credentials.PrivateKey == "" || cfg.Credentials.ClientEmail == "") {
-		errMsg := "clientEmail and privateKey are required for GCS credentials when workloadIdentity is not enabled"
-		return errors.New(errMsg)
+	opts, err := authOptions(ctx, cfg)
+	if err != nil {
+		return err
 	}
 
-	if cfg.Credentials.PrivateKey != "" && cfg.Credentials.ClientEmail != "" {
-		creds, merr := json.Marshal(ServiceAccountCredentials{
-			Type:                "service_account",
-			PrivateKey:          string(cfg.Credentials.PrivateKey),
-			ClientEmail:         string(cfg.Credentials.ClientEmail),
-			AuthURI:             "https://accounts.google.com/o/oauth2/auth",
-			TokenURI:            "https://oauth2.googleapis.com/token",
-			UniverseDomain:      "googleapis.com",
-			AuthProviderCertURL: "https://www.googleapis.com/oauth2/v1/certs",
-			ClientCertURL: fmt.Sprintf(
-				"https://www.googleapis.com/robot/v1/metadata/x509/%s",
-				string(cfg.Credentials.ClientEmail),
-			),
-		})
-		if merr != nil {
-			return errors.Wrap(merr, "marshal GCS credentials")
-		}
-		if cfg.ClientType == ClientTypeGRPC {
-			cli, err = storagegcs.NewGRPCClient(ctx,
-				option.WithCredentialsJSON(creds),
-				storagegcs.WithDisabledClientMetrics())
-		} else {
-			cli, err = storagegcs.NewClient(ctx, option.WithCredentialsJSON(creds))
-		}
+	var cli *storagegcs.Client
+	if cfg.ClientType == ClientTypeGRPC {
+		opts = append(opts, storagegcs.WithDisabledClientMetrics())
+		cli, err = storagegcs.NewGRPCClient(ctx, opts...)
 	} else {
-		// No explicit credentials — validate ADC resolves to allowed type (Workload Identity)
-		// We only check the credentials type, the scoped used hear doesn't really matter
-		adc, adcErr := google.FindDefaultCredentials(ctx, storagegcs.ScopeReadOnly)
-		if adcErr != nil {
-			return fmt.Errorf("finding default credentials: %w", adcErr)
-		}
-		adcErr = validateDefaultCredentialType(adc)
-		if adcErr != nil {
-			return fmt.Errorf("validate default credential type: %w", adcErr)
-		}
-		if cfg.ClientType == ClientTypeGRPC {
-			cli, err = storagegcs.NewGRPCClient(ctx, storagegcs.WithDisabledClientMetrics())
-		} else {
-			cli, err = storagegcs.NewClient(ctx)
-		}
+		cli, err = storagegcs.NewClient(ctx, opts...)
 	}
-
 	if err != nil {
 		return errors.Wrap(err, "new GCS client")
 	}
@@ -85,6 +48,53 @@ func (g *GCS) initClient() error {
 	g.client = cli
 	g.bucketHandle = cli.Bucket(cfg.Bucket)
 	return nil
+}
+
+func authOptions(ctx context.Context, cfg *Config) ([]option.ClientOption, error) {
+	if cfg.Credentials.PrivateKey != "" && cfg.Credentials.ClientEmail != "" {
+		creds, err := serviceAccountCredentialsJSON(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return []option.ClientOption{option.WithCredentialsJSON(creds)}, nil
+	}
+
+	if !cfg.Credentials.WorkloadIdentity {
+		errMsg := "clientEmail and privateKey are required for GCS credentials when workloadIdentity is not enabled"
+		return nil, errors.New(errMsg)
+	}
+
+	// No explicit credentials: validate ADC resolves to an allowed Workload Identity type.
+	// We only check the credentials type; the scope used here doesn't matter.
+	adc, err := google.FindDefaultCredentials(ctx, storagegcs.ScopeReadOnly)
+	if err != nil {
+		return nil, fmt.Errorf("finding default credentials: %w", err)
+	}
+	if err := validateDefaultCredentialType(adc); err != nil {
+		return nil, fmt.Errorf("validate default credential type: %w", err)
+	}
+
+	return nil, nil
+}
+
+func serviceAccountCredentialsJSON(cfg *Config) ([]byte, error) {
+	creds, err := json.Marshal(ServiceAccountCredentials{
+		Type:                "service_account",
+		PrivateKey:          string(cfg.Credentials.PrivateKey),
+		ClientEmail:         string(cfg.Credentials.ClientEmail),
+		AuthURI:             "https://accounts.google.com/o/oauth2/auth",
+		TokenURI:            "https://oauth2.googleapis.com/token",
+		UniverseDomain:      "googleapis.com",
+		AuthProviderCertURL: "https://www.googleapis.com/oauth2/v1/certs",
+		ClientCertURL: fmt.Sprintf(
+			"https://www.googleapis.com/robot/v1/metadata/x509/%s",
+			string(cfg.Credentials.ClientEmail),
+		),
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "marshal GCS credentials")
+	}
+	return creds, nil
 }
 
 // validateDefaultCredentialType validates that credentials are of type "external_account" used for Workload Identity
