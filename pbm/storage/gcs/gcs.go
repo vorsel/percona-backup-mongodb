@@ -1,12 +1,14 @@
 package gcs
 
 import (
+	"context"
 	"io"
 	"path"
 	"strings"
 	"time"
 
 	storagegcs "cloud.google.com/go/storage"
+	"google.golang.org/api/iterator"
 
 	"github.com/percona/percona-backup-mongodb/pbm/errors"
 	"github.com/percona/percona-backup-mongodb/pbm/log"
@@ -114,29 +116,172 @@ func (*GCS) Type() storage.Type {
 }
 
 func (g *GCS) Save(name string, data io.Reader, options ...storage.Option) error {
-	return g.save(name, data, options...)
+	opts := storage.GetDefaultOpts()
+	for _, opt := range options {
+		if err := opt(opts); err != nil {
+			return errors.Wrap(err, "processing options for save")
+		}
+	}
+
+	ctx := context.Background()
+	w := g.bucketHandle.Object(path.Join(g.cfg.Prefix, name)).NewWriter(ctx)
+	if g.cfg.parallelUploadEnabled() {
+		if g.log != nil && opts.UseLogger {
+			g.log.Debug(`uploading %q [size hint: %v (%v); parallel upload part size: %v (%v); concurrency: %d]`,
+				name,
+				opts.Size, storage.PrettySize(opts.Size),
+				g.cfg.ChunkSize, storage.PrettySize(int64(g.cfg.ChunkSize)),
+				g.cfg.ParallelUploadConcurrency)
+		}
+
+		w.EnableParallelUpload = true
+		w.ParallelUploadConfig = storagegcs.ParallelUploadConfig{
+			PartSize:       g.cfg.ChunkSize,
+			MaxConcurrency: g.cfg.ParallelUploadConcurrency,
+		}
+	} else {
+		const align int64 = 256 << 10 // 256 KiB (both min size and alignment)
+
+		partSize := storage.ComputePartSize(
+			opts.Size,
+			defaultChunkSize,
+			align,
+			10_000,
+			int64(g.cfg.ChunkSize),
+		)
+
+		if rem := partSize % align; rem != 0 {
+			partSize += align - rem
+		}
+
+		if g.log != nil && opts.UseLogger {
+			g.log.Debug(`uploading %q [size hint: %v (%v); part size: %v (%v)]`,
+				name,
+				opts.Size, storage.PrettySize(opts.Size),
+				partSize, storage.PrettySize(partSize))
+		}
+
+		w.ChunkSize = int(partSize)
+		w.ChunkRetryDeadline = g.cfg.Retryer.ChunkRetryDeadline
+	}
+	if g.log != nil && opts.UseLogger {
+		w.ProgressFunc = func(written int64) {
+			if opts.Size > 0 {
+				g.log.Debug("uploaded %v / %v (%.1f%%)",
+					written, opts.Size,
+					float64(written)*100/float64(opts.Size))
+			} else {
+				g.log.Debug("uploaded %v (total unknown)", written)
+			}
+		}
+	}
+
+	if _, err := io.Copy(w, data); err != nil {
+		return errors.Wrap(err, "save data")
+	}
+
+	if err := w.Close(); err != nil {
+		return errors.Wrap(err, "writer close")
+	}
+
+	return nil
 }
 
 func (g *GCS) FileStat(name string) (storage.FileInfo, error) {
-	return g.fileStat(name)
+	ctx := context.Background()
+
+	attrs, err := g.bucketHandle.Object(path.Join(g.cfg.Prefix, name)).Attrs(ctx)
+	if err != nil {
+		if errors.Is(err, storagegcs.ErrObjectNotExist) {
+			return storage.FileInfo{}, storage.ErrNotExist
+		}
+
+		return storage.FileInfo{}, errors.Wrap(err, "get properties")
+	}
+
+	inf := storage.FileInfo{
+		Name: attrs.Name,
+		Size: attrs.Size,
+	}
+
+	if inf.Size == 0 {
+		return inf, storage.ErrEmpty
+	}
+
+	return inf, nil
 }
 
 func (g *GCS) List(prefix, suffix string) ([]storage.FileInfo, error) {
-	prfx := path.Join(g.cfg.Prefix, prefix)
-
-	if prfx != "" && !strings.HasSuffix(prfx, "/") {
-		prfx += "/"
+	prefix = path.Join(g.cfg.Prefix, prefix)
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
 	}
 
-	return g.list(prfx, suffix)
+	ctx := context.Background()
+
+	var files []storage.FileInfo
+	it := g.bucketHandle.Objects(ctx, &storagegcs.Query{Prefix: prefix})
+
+	for {
+		attrs, err := it.Next()
+
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+
+		if err != nil {
+			return nil, errors.Wrap(err, "list objects")
+		}
+
+		name := attrs.Name
+		name = strings.TrimPrefix(name, prefix)
+		if len(name) == 0 {
+			continue
+		}
+		if name[0] == '/' {
+			name = name[1:]
+		}
+
+		if suffix != "" && !strings.HasSuffix(name, suffix) {
+			continue
+		}
+
+		files = append(files, storage.FileInfo{
+			Name: name,
+			Size: attrs.Size,
+		})
+	}
+
+	return files, nil
 }
 
 func (g *GCS) Delete(name string) error {
-	return g.delete(name)
+	ctx := context.Background()
+
+	err := g.bucketHandle.Object(path.Join(g.cfg.Prefix, name)).Delete(ctx)
+	if err != nil {
+		if errors.Is(err, storagegcs.ErrObjectNotExist) {
+			return storage.ErrNotExist
+		}
+		return errors.Wrap(err, "delete object")
+	}
+
+	return nil
 }
 
 func (g *GCS) Copy(src, dst string) error {
-	return g.copy(src, dst)
+	ctx := context.Background()
+
+	srcObj := g.bucketHandle.Object(path.Join(g.cfg.Prefix, src))
+	dstObj := g.bucketHandle.Object(path.Join(g.cfg.Prefix, dst))
+
+	_, err := g.FileStat(src)
+	if err == storage.ErrNotExist {
+		return err
+	}
+
+	_, err = dstObj.CopierFrom(srcObj).Run(ctx)
+	return err
 }
 
 func (g *GCS) Close() error {
