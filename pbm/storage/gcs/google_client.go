@@ -56,7 +56,7 @@ func authOptions(ctx context.Context, cfg *Config) ([]option.ClientOption, error
 		if err != nil {
 			return nil, err
 		}
-		return []option.ClientOption{option.WithCredentialsJSON(creds)}, nil
+		return []option.ClientOption{option.WithAuthCredentialsJSON(option.ServiceAccount, creds)}, nil
 	}
 
 	if !cfg.Credentials.WorkloadIdentity {
