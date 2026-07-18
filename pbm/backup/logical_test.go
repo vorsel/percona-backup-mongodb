@@ -1,12 +1,82 @@
 package backup
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/event"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/percona/percona-backup-mongodb/pbm/util"
 )
+
+func TestGetNamespacesSizeConcurrency(t *testing.T) {
+	TestEnv.Reset(t)
+
+	ctx := t.Context()
+	const limit = 2
+	nss := []string{"pbm1700.c1", "pbm1700.c2", "pbm1700.c3"}
+	for _, coll := range []string{"c1", "c2", "c3"} {
+		require.NoError(t, TestEnv.Client.MongoClient().Database("pbm1700").CreateCollection(ctx, coll))
+	}
+
+	var active, peak atomic.Int32
+	monitor := &event.CommandMonitor{
+		Started: func(_ context.Context, evt *event.CommandStartedEvent) {
+			if evt.CommandName != "collStats" {
+				return
+			}
+
+			current := active.Add(1)
+			for maximum := peak.Load(); current > maximum; maximum = peak.Load() {
+				if peak.CompareAndSwap(maximum, current) {
+					break
+				}
+			}
+		},
+		Succeeded: func(_ context.Context, evt *event.CommandSucceededEvent) {
+			if evt.CommandName == "collStats" {
+				active.Add(-1)
+			}
+		},
+		Failed: func(_ context.Context, evt *event.CommandFailedEvent) {
+			if evt.CommandName == "collStats" {
+				active.Add(-1)
+			}
+		},
+	}
+	client, err := mongo.Connect(options.Client().ApplyURI(TestEnv.Brief.URI).SetMonitor(monitor))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, client.Disconnect(context.Background()))
+	})
+
+	admin := TestEnv.Client.MongoClient().Database("admin")
+	require.NoError(t, admin.RunCommand(ctx, bson.D{
+		{"configureFailPoint", "failCommand"},
+		{"mode", "alwaysOn"},
+		{"data", bson.D{
+			{"failCommands", bson.A{"collStats"}},
+			{"blockConnection", true},
+			{"blockTimeMS", 100},
+		}},
+	}).Err())
+	t.Cleanup(func() {
+		require.NoError(t, admin.RunCommand(context.Background(), bson.D{
+			{"configureFailPoint", "failCommand"},
+			{"mode", "off"},
+		}).Err())
+	})
+
+	sizes, err := getNamespacesSize(ctx, client, nss, limit)
+	require.NoError(t, err)
+	require.Len(t, sizes, len(nss))
+	require.Equal(t, int32(limit), peak.Load())
+}
 
 func TestMakeConfigsvrDocFilter(t *testing.T) {
 	t.Run("selective backup without wildcards", func(t *testing.T) {

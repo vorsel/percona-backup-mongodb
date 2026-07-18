@@ -41,7 +41,18 @@ func (b *Backup) doLogical(
 			return errors.Wrap(err, "check for timeseries")
 		}
 	}
-	nssSize, err := getNamespacesSize(ctx, b.nodeConn, bcp.Namespaces)
+
+	numParallelColls := b.numParallelColls
+	if bcp.NumParallelColls != nil {
+		if *bcp.NumParallelColls > 0 {
+			numParallelColls = int(*bcp.NumParallelColls)
+		} else {
+			l.Warning("invalid value of NumParallelCollections (%v). fallback to %v",
+				numParallelColls, b.numParallelColls)
+		}
+	}
+
+	nssSize, err := getNamespacesSize(ctx, b.nodeConn, bcp.Namespaces, numParallelColls)
 	if err != nil {
 		return errors.Wrap(err, "get namespaces size")
 	}
@@ -144,15 +155,6 @@ func (b *Backup) doLogical(
 		}
 	}
 
-	numParallelColls := b.numParallelColls
-	if bcp.NumParallelColls != nil {
-		if *bcp.NumParallelColls > 0 {
-			numParallelColls = int(*bcp.NumParallelColls)
-		} else {
-			l.Warning("invalid value of NumParallelCollections (%v). fallback to %v",
-				numParallelColls, b.numParallelColls)
-		}
-	}
 	l.Debug("dumping up to %d collections in parallel", numParallelColls)
 
 	nsFilter := archive.DefaultNSFilter
@@ -431,7 +433,7 @@ type collSize struct {
 	StorageSize int64 `bson:"storageSize"` // WiredTiger compressed on-disk size
 }
 
-func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string) (map[string]collSize, error) {
+func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string, concurrency int) (map[string]collSize, error) {
 	rv := make(map[string]collSize)
 
 	dbs, err := m.ListDatabaseNames(ctx, bson.D{})
@@ -443,23 +445,23 @@ func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string) (map[
 	}
 
 	isSelected := util.MakeSelectedPred(nss)
-
 	mu := sync.Mutex{}
-	eg, ctx := errgroup.WithContext(ctx)
+	colEg, colCtx := errgroup.WithContext(ctx)
+	colEg.SetLimit(concurrency)
+	dbEg, dbCtx := errgroup.WithContext(ctx)
+	dbEg.SetLimit(concurrency)
 
 	for _, db := range dbs {
 		db := db
 
-		eg.Go(func() error {
-			res, err := m.Database(db).ListCollectionSpecifications(ctx, bson.D{})
+		dbEg.Go(func() error {
+			res, err := m.Database(db).ListCollectionSpecifications(dbCtx, bson.D{})
 			if err != nil {
 				return errors.Wrapf(err, "list collections for %q", db)
 			}
 			if len(res) == 0 {
 				return nil
 			}
-
-			eg, ctx := errgroup.WithContext(ctx)
 
 			for _, coll := range res {
 				if coll.Type == "view" || strings.HasPrefix(coll.Name, "system.buckets.") {
@@ -471,8 +473,8 @@ func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string) (map[
 					continue
 				}
 
-				eg.Go(func() error {
-					res := m.Database(db).RunCommand(ctx, bson.D{{"collStats", coll.Name}})
+				colEg.Go(func() error {
+					res := m.Database(db).RunCommand(colCtx, bson.D{{"collStats", coll.Name}})
 					if err := res.Err(); err != nil {
 						return errors.Wrapf(err, "collStats %q", ns)
 					}
@@ -491,12 +493,17 @@ func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string) (map[
 				})
 			}
 
-			return eg.Wait()
+			return nil
 		})
 	}
 
-	err = eg.Wait()
-	return rv, err
+	dbErr := dbEg.Wait()
+	colErr := colEg.Wait()
+	if dbErr != nil {
+		return rv, dbErr
+	}
+
+	return rv, colErr
 }
 
 // getOplogBytesPerSecond returns the average number of bytes written to the
