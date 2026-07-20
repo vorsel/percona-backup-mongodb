@@ -27,6 +27,8 @@ import (
 	"github.com/percona/percona-backup-mongodb/pbm/version"
 )
 
+const namespaceStatsConcurrency = 50
+
 func (b *Backup) doLogical(
 	ctx context.Context,
 	bcp *ctrl.BackupCmd,
@@ -41,18 +43,7 @@ func (b *Backup) doLogical(
 			return errors.Wrap(err, "check for timeseries")
 		}
 	}
-
-	numParallelColls := b.numParallelColls
-	if bcp.NumParallelColls != nil {
-		if *bcp.NumParallelColls > 0 {
-			numParallelColls = int(*bcp.NumParallelColls)
-		} else {
-			l.Warning("invalid value of NumParallelCollections (%v). fallback to %v",
-				numParallelColls, b.numParallelColls)
-		}
-	}
-
-	nssSize, err := getNamespacesSize(ctx, b.nodeConn, bcp.Namespaces, numParallelColls)
+	nssSize, err := getNamespacesSize(ctx, b.nodeConn, bcp.Namespaces)
 	if err != nil {
 		return errors.Wrap(err, "get namespaces size")
 	}
@@ -155,6 +146,15 @@ func (b *Backup) doLogical(
 		}
 	}
 
+	numParallelColls := b.numParallelColls
+	if bcp.NumParallelColls != nil {
+		if *bcp.NumParallelColls > 0 {
+			numParallelColls = int(*bcp.NumParallelColls)
+		} else {
+			l.Warning("invalid value of NumParallelCollections (%v). fallback to %v",
+				numParallelColls, b.numParallelColls)
+		}
+	}
 	l.Debug("dumping up to %d collections in parallel", numParallelColls)
 
 	nsFilter := archive.DefaultNSFilter
@@ -433,7 +433,12 @@ type collSize struct {
 	StorageSize int64 `bson:"storageSize"` // WiredTiger compressed on-disk size
 }
 
-func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string, concurrency int) (map[string]collSize, error) {
+func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string) (map[string]collSize, error) {
+	type namespace struct {
+		db   string
+		coll string
+	}
+
 	rv := make(map[string]collSize)
 
 	dbs, err := m.ListDatabaseNames(ctx, bson.D{})
@@ -445,12 +450,12 @@ func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string, concu
 	}
 
 	isSelected := util.MakeSelectedPred(nss)
-	mu := sync.Mutex{}
-	colEg, colCtx := errgroup.WithContext(ctx)
-	colEg.SetLimit(concurrency)
-	dbEg, dbCtx := errgroup.WithContext(ctx)
-	dbEg.SetLimit(concurrency)
 
+	mu := sync.Mutex{}
+	dbEg, dbCtx := errgroup.WithContext(ctx)
+	dbEg.SetLimit(namespaceStatsConcurrency)
+
+	var collections []namespace
 	for _, db := range dbs {
 		db := db
 
@@ -473,24 +478,9 @@ func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string, concu
 					continue
 				}
 
-				colEg.Go(func() error {
-					res := m.Database(db).RunCommand(colCtx, bson.D{{"collStats", coll.Name}})
-					if err := res.Err(); err != nil {
-						return errors.Wrapf(err, "collStats %q", ns)
-					}
-
-					var doc collSize
-
-					if err := res.Decode(&doc); err != nil {
-						return errors.Wrapf(err, "decode %q", ns)
-					}
-
-					mu.Lock()
-					rv[ns] = doc
-					mu.Unlock()
-
-					return nil
-				})
+				mu.Lock()
+				collections = append(collections, namespace{db: db, coll: coll.Name})
+				mu.Unlock()
 			}
 
 			return nil
@@ -498,12 +488,38 @@ func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string, concu
 	}
 
 	dbErr := dbEg.Wait()
-	colErr := colEg.Wait()
 	if dbErr != nil {
 		return rv, dbErr
 	}
 
-	return rv, colErr
+	rv = make(map[string]collSize, len(collections))
+	colEg, colCtx := errgroup.WithContext(ctx)
+	colEg.SetLimit(namespaceStatsConcurrency)
+
+	for _, ns := range collections {
+		name := ns.db + "." + ns.coll
+
+		colEg.Go(func() error {
+			res := m.Database(ns.db).RunCommand(colCtx, bson.D{{"collStats", ns.coll}})
+			if err := res.Err(); err != nil {
+				return errors.Wrapf(err, "collStats %q", name)
+			}
+
+			var doc collSize
+
+			if err := res.Decode(&doc); err != nil {
+				return errors.Wrapf(err, "decode %q", name)
+			}
+
+			mu.Lock()
+			rv[name] = doc
+			mu.Unlock()
+
+			return nil
+		})
+	}
+
+	return rv, colEg.Wait()
 }
 
 // getOplogBytesPerSecond returns the average number of bytes written to the

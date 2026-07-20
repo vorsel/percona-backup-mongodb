@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 
@@ -18,9 +19,10 @@ func TestGetNamespacesSizeConcurrency(t *testing.T) {
 	TestEnv.Reset(t)
 
 	ctx := t.Context()
-	const limit = 2
-	nss := []string{"pbm1700.c1", "pbm1700.c2", "pbm1700.c3"}
-	for _, coll := range []string{"c1", "c2", "c3"} {
+	nss := make([]string, 0, namespaceStatsConcurrency+1)
+	for i := 0; i <= namespaceStatsConcurrency; i++ {
+		coll := fmt.Sprintf("c%d", i)
+		nss = append(nss, "pbm1700."+coll)
 		require.NoError(t, TestEnv.Client.MongoClient().Database("pbm1700").CreateCollection(ctx, coll))
 	}
 
@@ -72,10 +74,10 @@ func TestGetNamespacesSizeConcurrency(t *testing.T) {
 		}).Err())
 	})
 
-	sizes, err := getNamespacesSize(ctx, client, nss, limit)
+	sizes, err := getNamespacesSize(ctx, client, nss)
 	require.NoError(t, err)
 	require.Len(t, sizes, len(nss))
-	require.Equal(t, int32(limit), peak.Load())
+	require.Equal(t, int32(namespaceStatsConcurrency), peak.Load())
 }
 
 func TestMakeConfigsvrDocFilter(t *testing.T) {
