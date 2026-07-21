@@ -43,10 +43,12 @@ func (b *Backup) doLogical(
 			return errors.Wrap(err, "check for timeseries")
 		}
 	}
+	sizesStarted := time.Now()
 	nssSize, err := getNamespacesSize(ctx, b.nodeConn, bcp.Namespaces)
 	if err != nil {
 		return errors.Wrap(err, "get namespaces size")
 	}
+	l.Info("got sizes of %d namespaces in %s", len(nssSize), time.Since(sizesStarted).Round(time.Millisecond))
 
 	sizeHints := make(map[string]int64, len(nssSize))
 	for ns, cs := range nssSize {
