@@ -11,18 +11,6 @@ import (
 	"github.com/percona/percona-backup-mongodb/x/pbm/storage/fs"
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 	"gopkg.in/yaml.v2"
-	// "github.com/percona/percona-backup-mongodb/pbm/compress"
-	// "github.com/percona/percona-backup-mongodb/pbm/connect"
-	// "github.com/percona/percona-backup-mongodb/pbm/defs"
-	// "github.com/percona/percona-backup-mongodb/pbm/errors"
-	// "github.com/percona/percona-backup-mongodb/pbm/storage"
-	// "github.com/percona/percona-backup-mongodb/pbm/storage/fs"
-	// "github.com/percona/percona-backup-mongodb/pbm/topo"
-	// "go.mongodb.org/mongo-driver/v2/bson"
-	// "go.mongodb.org/mongo-driver/v2/mongo"
-	// "go.mongodb.org/mongo-driver/v2/mongo/options"
-	// "go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
-	// "gopkg.in/yaml.v2"
 )
 
 var (
