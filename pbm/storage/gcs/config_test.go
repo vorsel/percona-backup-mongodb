@@ -22,7 +22,8 @@ func TestCast(t *testing.T) {
 		t.Fatalf("got error during Cast: %v", err)
 	}
 	want := &Config{
-		ChunkSize: defaultChunkSize,
+		ClientType: ClientTypeJSON,
+		ChunkSize:  defaultChunkSize,
 		Retryer: &Retryer{
 			MaxAttempts:        defaultMaxAttempts,
 			BackoffInitial:     defaultBackoffInitial,
@@ -36,21 +37,16 @@ func TestCast(t *testing.T) {
 		t.Fatalf("wrong config after Cast, diff=%s", cmp.Diff(*c, *want))
 	}
 
-	t.Run("parallel upload validation", func(t *testing.T) {
+	t.Run("validation", func(t *testing.T) {
 		for _, tt := range []struct {
 			name string
 			cfg  *Config
 			err  string
 		}{
 			{
-				name: "negative part size",
-				cfg:  &Config{ParallelUpload: &ParallelUpload{PartSize: -1}},
-				err:  "parallelUpload.partSize cannot be negative",
-			},
-			{
-				name: "negative max concurrency",
-				cfg:  &Config{ParallelUpload: &ParallelUpload{MaxConcurrency: -1}},
-				err:  "parallelUpload.maxConcurrency cannot be negative",
+				name: "invalid client type",
+				cfg:  &Config{ClientType: ClientType("xml")},
+				err:  `invalid clientType "xml"`,
 			},
 		} {
 			t.Run(tt.name, func(t *testing.T) {
@@ -59,6 +55,35 @@ func TestCast(t *testing.T) {
 					t.Fatalf("expected %q, got %v", tt.err, err)
 				}
 			})
+		}
+	})
+
+	t.Run("negative parallel upload concurrency is disabled", func(t *testing.T) {
+		c := &Config{
+			ClientType:                ClientTypeGRPC,
+			ParallelUploadConcurrency: -1,
+		}
+		err := c.Cast()
+		if err != nil {
+			t.Fatalf("got error during Cast: %v", err)
+		}
+		if c.ChunkSize != defaultChunkSize {
+			t.Fatalf("wrong chunk size: got %d, want %d", c.ChunkSize, defaultChunkSize)
+		}
+	})
+
+	t.Run("parallel upload default chunk size", func(t *testing.T) {
+		c := &Config{
+			ClientType:                ClientTypeGRPC,
+			ParallelUploadConcurrency: 2,
+		}
+		err := c.Cast()
+		if err != nil {
+			t.Fatalf("got error during Cast: %v", err)
+		}
+		if c.ChunkSize != defaultParallelUploadChunkSize {
+			t.Fatalf("wrong parallel upload chunk size: got %d, want %d",
+				c.ChunkSize, defaultParallelUploadChunkSize)
 		}
 	})
 }
@@ -71,11 +96,8 @@ func TestConfig(t *testing.T) {
 			ClientEmail: "email@example.com",
 			PrivateKey:  "-----BEGIN PRIVATE KEY-----\nKey\n-----END PRIVATE KEY-----\n",
 		},
-		ParallelUpload: &ParallelUpload{
-			Enabled:        true,
-			PartSize:       16 * 1024 * 1024,
-			MaxConcurrency: 4,
-		},
+		ClientType:                ClientTypeGRPC,
+		ParallelUploadConcurrency: 4,
 	}
 
 	t.Run("Clone", func(t *testing.T) {
@@ -88,11 +110,11 @@ func TestConfig(t *testing.T) {
 			t.Error("expected clone to be equal")
 		}
 
-		opts.ParallelUpload.MaxConcurrency = 8
+		opts.ParallelUploadConcurrency = 8
 		if opts.Equal(clone) {
 			t.Error("expected clone to be unchanged when updating original")
 		}
-		opts.ParallelUpload.MaxConcurrency = 4
+		opts.ParallelUploadConcurrency = 4
 
 		opts.Bucket = "updatedName"
 		if opts.Equal(clone) {
@@ -119,9 +141,15 @@ func TestConfig(t *testing.T) {
 		}
 
 		clone = opts.Clone()
-		clone.ParallelUpload.Enabled = false
+		clone.ClientType = ClientTypeJSON
 		if opts.Equal(clone) {
-			t.Error("expected not to be equal when updating parallel upload")
+			t.Error("expected not to be equal when updating client type")
+		}
+
+		clone = opts.Clone()
+		clone.ParallelUploadConcurrency = 8
+		if opts.Equal(clone) {
+			t.Error("expected not to be equal when updating parallel upload concurrency")
 		}
 	})
 
