@@ -358,7 +358,6 @@ func UploadWithOpts(
 //
 // It's intended for backends that support multipart or resumable uploads:
 //   - AWS S3 (multipart upload with part count limits)
-//   - GCS XML API (via MinIO, with HMAC credentials)
 //   - GCS JSON API (resumable upload, used for Writer.ChunkSize tuning)
 //
 // Behavior:
@@ -369,7 +368,7 @@ func UploadWithOpts(
 //   - The chunk size is scaled by a 1.5x safety factor to ensure a margin.
 //
 // This function ensures that uploads stay within service limits.
-// For example, AWS S3 and GCS XML APIs have a hard cap of 10,000 parts, so:
+// For example, AWS S3 APIs have a hard cap of 10,000 parts, so:
 //   - With a 10 MiB part size, the max supported file size is ~97.6 GiB.
 //   - Larger files must use larger part sizes to stay under the limit.
 //

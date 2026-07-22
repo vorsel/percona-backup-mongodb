@@ -151,16 +151,16 @@
 ## leave temporary objects behind, so a bucket lifecycle cleanup rule is recommended.
 #      parallelUploadConcurrency: 4
 
-## GCS access credentials. You can use either HMAC or Service Account keys.
-## HMAC Example:
-#     credentials:
-#       hmacAccessKey: GOOG1E7GHK2...
-#       hmacSecret: U7PCRkLy...
-
+## GCS access credentials. You can use Service Account keys or Workload Identity.
 ## Service Account Example:
 #     credentials:
 #       clientEmail: account@dev-sandbox.iam.gserviceaccount.com
 #       privateKey: "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg...kqh3vNY2NQ=\n-----END PRIVATE KEY-----\n"
+#
+
+## Workload Identity Example:
+#     credentials:
+#       workloadIdentity: true
 #
 
 ## Retry upload configuration options.
