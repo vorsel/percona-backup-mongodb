@@ -47,9 +47,6 @@ func RunCtrlAgent(ctx context.Context, cfg *CtrlAgentConfig) error {
 	defer etcdSrv.Close()
 	log.Printf("ctrl-agent %s started control collection db", cfg.Name)
 
-	// The config service talks to the local embedded etcd via an in-process
-	// client; leaderOnly gates writes so only the leader (which owns this etcd)
-	// serves config requests.
 	configSvc := config.New(etcdSrv.Client())
 
 	// wire the status service before starting its loop
