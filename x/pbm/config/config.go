@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"io"
 	"maps"
 
 	"github.com/percona/percona-backup-mongodb/x/pbm/compress"
@@ -38,6 +39,24 @@ func (c *Config) String() string {
 	}
 
 	return string(b)
+}
+
+// Parse reads a YAML config document from r. It rejects unknown fields and
+// validates the storage section.
+func Parse(r io.Reader) (*Config, error) {
+	cfg := &Config{}
+
+	dec := yaml.NewDecoder(r)
+	dec.SetStrict(true)
+	if err := dec.Decode(cfg); err != nil {
+		return nil, errors.Wrap(err, "decode")
+	}
+
+	if err := cfg.Storage.Cast(); err != nil {
+		return nil, errors.Wrap(err, "storage cast")
+	}
+
+	return cfg, nil
 }
 
 // Priority contains priority values for cluster members.
