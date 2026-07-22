@@ -7,6 +7,7 @@ import (
 	"log"
 
 	"github.com/percona/percona-backup-mongodb/x/pbm/api"
+	"github.com/percona/percona-backup-mongodb/x/pbm/config"
 	"github.com/percona/percona-backup-mongodb/x/pbm/connect"
 	"github.com/percona/percona-backup-mongodb/x/pbm/disco"
 	"github.com/percona/percona-backup-mongodb/x/pbm/etcd"
@@ -46,12 +47,17 @@ func RunCtrlAgent(ctx context.Context, cfg *CtrlAgentConfig) error {
 	defer etcdSrv.Close()
 	log.Printf("ctrl-agent %s started control collection db", cfg.Name)
 
+	// The config service talks to the local embedded etcd via an in-process
+	// client; leaderOnly gates writes so only the leader (which owns this etcd)
+	// serves config requests.
+	configSvc := config.New(etcdSrv.Client())
+
 	// wire the status service before starting its loop
 	statusSvc.SetPublisher(d)
 	statusSvc.SetLeaderChecker(etcdSrv)
 	go statusSvc.Run(ctx)
 
-	apiSrv := api.Start(api.Config{Port: cfg.APISrvPort}, api.NewRouter(statusSvc))
+	apiSrv := api.Start(api.Config{Port: cfg.APISrvPort}, api.NewRouter(statusSvc, configSvc))
 	log.Printf("ctrl-agent %s started REST API on port %d", cfg.Name, cfg.APISrvPort)
 
 	select {
