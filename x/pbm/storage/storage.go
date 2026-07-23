@@ -9,6 +9,8 @@ import (
 	"log"
 	"strings"
 
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+
 	"github.com/percona/percona-backup-mongodb/x/pbm/compress"
 	"github.com/percona/percona-backup-mongodb/x/pbm/defs"
 	"github.com/percona/percona-backup-mongodb/x/pbm/errors"
@@ -448,4 +450,36 @@ func TrimSlashes(s string) string {
 
 func Ref[T any](v T) *T {
 	return &v
+}
+
+// ReadBSONBuffer reads raw bson document from r reader using buf buffer
+func ReadBSONBuffer(r io.Reader, buf []byte) ([]byte, error) {
+	// todo: ReadBSONBuffer came from pbm's archive pkg, see the right place to put it
+	var l [4]byte
+
+	_, err := io.ReadFull(r, l[:])
+	if err != nil {
+		return nil, errors.Wrap(err, "length")
+	}
+
+	size := int(int32(l[0]) | int32(l[1])<<8 | int32(l[2])<<16 | int32(l[3])<<24)
+	if size < 0 {
+		return nil, bsoncore.ErrInvalidLength
+	}
+
+	if len(buf) < size {
+		buf = make([]byte, size)
+	}
+
+	copy(buf, l[:])
+	_, err = io.ReadFull(r, buf[4:size])
+	if err != nil {
+		return nil, err
+	}
+
+	if buf[size-1] != 0x00 {
+		return nil, bsoncore.ErrMissingNull
+	}
+
+	return buf[:size], nil
 }
