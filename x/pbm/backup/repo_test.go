@@ -3,8 +3,10 @@ package backup
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,8 @@ import (
 
 	"github.com/percona/percona-backup-mongodb/x/pbm/defs"
 	"github.com/percona/percona-backup-mongodb/x/pbm/errors"
+	"github.com/percona/percona-backup-mongodb/x/pbm/storage"
+	"github.com/percona/percona-backup-mongodb/x/pbm/storage/fs"
 )
 
 const etcdImage = "gcr.io/etcd-development/etcd:v3.6.12"
@@ -45,6 +49,15 @@ func TestMain(m *testing.M) {
 func newTestRepo(t *testing.T) *Repo {
 	t.Helper()
 
+	repo, _ := newTestRepoWithStorage(t)
+	return repo
+}
+
+// newTestRepoWithStorage builds a repo backed by a fresh etcd keyspace and an
+// fs storage rooted at a temp dir, returning the storage so tests can seed it.
+func newTestRepoWithStorage(t *testing.T) (*Repo, storage.Storage) {
+	t.Helper()
+
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   testEndpoints,
 		DialTimeout: 5 * time.Second,
@@ -58,7 +71,12 @@ func newTestRepo(t *testing.T) *Repo {
 		t.Fatalf("reset backup keys: %v", err)
 	}
 
-	return New(cli)
+	stg, err := fs.New(&fs.Config{Path: t.TempDir()})
+	if err != nil {
+		t.Fatalf("create fs storage: %v", err)
+	}
+
+	return New(cli, stg), stg
 }
 
 func testMeta(name string) *BackupMeta {
@@ -314,6 +332,92 @@ func TestDeleteAll(t *testing.T) {
 		}
 		if n != 0 {
 			t.Errorf("DeleteAll on empty store: deleted %d, want 0", n)
+		}
+	})
+}
+
+func saveMeta(t *testing.T, stg storage.Storage, meta *BackupMeta) {
+	t.Helper()
+
+	data, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatalf("marshal meta %q: %v", meta.Name, err)
+	}
+	if err := stg.Save(meta.Name+defs.MetadataFileSuffix, strings.NewReader(string(data))); err != nil {
+		t.Fatalf("save meta %q: %v", meta.Name, err)
+	}
+}
+
+func TestSyncBackupList(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("loads backups from storage into etcd", func(t *testing.T) {
+		repo, stg := newTestRepoWithStorage(t)
+
+		saveMeta(t, stg, testMeta("2026-04-12T09:00:00Z"))
+		saveMeta(t, stg, testMeta("2026-04-14T14:07:00Z"))
+
+		if err := repo.SyncBackupList(ctx); err != nil {
+			t.Fatalf("SyncBackupList: %v", err)
+		}
+
+		all, err := repo.GetAll(ctx)
+		if err != nil {
+			t.Fatalf("GetAll: %v", err)
+		}
+		got := make([]string, len(all))
+		for i, meta := range all {
+			got[i] = meta.Name
+		}
+		want := []string{"2026-04-12T09:00:00Z", "2026-04-14T14:07:00Z"}
+		if len(got) != len(want) {
+			t.Fatalf("GetAll after sync: got %v, want %v", got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("GetAll after sync: got %v, want %v", got, want)
+			}
+		}
+	})
+
+	t.Run("replaces stale metadata already in etcd", func(t *testing.T) {
+		repo, stg := newTestRepoWithStorage(t)
+
+		// A doc that only exists in etcd must be dropped by the sync.
+		if err := repo.Insert(ctx, testMeta("stale")); err != nil {
+			t.Fatalf("seed Insert: %v", err)
+		}
+		saveMeta(t, stg, testMeta("fresh"))
+
+		if err := repo.SyncBackupList(ctx); err != nil {
+			t.Fatalf("SyncBackupList: %v", err)
+		}
+
+		if _, err := repo.Get(ctx, "stale"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("Get stale after sync: got %v, want ErrNotFound", err)
+		}
+		if _, err := repo.Get(ctx, "fresh"); err != nil {
+			t.Errorf("Get fresh after sync: %v", err)
+		}
+	})
+
+	t.Run("empty storage clears etcd", func(t *testing.T) {
+		repo := newTestRepo(t)
+
+		if err := repo.Insert(ctx, testMeta("orphan")); err != nil {
+			t.Fatalf("seed Insert: %v", err)
+		}
+
+		if err := repo.SyncBackupList(ctx); err != nil {
+			t.Fatalf("SyncBackupList: %v", err)
+		}
+
+		all, err := repo.GetAll(ctx)
+		if err != nil {
+			t.Fatalf("GetAll: %v", err)
+		}
+		if len(all) != 0 {
+			t.Fatalf("GetAll after sync of empty storage: got %d backups, want 0", len(all))
 		}
 	})
 }
