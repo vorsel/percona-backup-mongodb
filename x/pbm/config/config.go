@@ -7,9 +7,9 @@ import (
 	"maps"
 
 	"github.com/percona/percona-backup-mongodb/x/pbm/compress"
+	"github.com/percona/percona-backup-mongodb/x/pbm/config/fs"
 	"github.com/percona/percona-backup-mongodb/x/pbm/errors"
 	"github.com/percona/percona-backup-mongodb/x/pbm/storage"
-	"github.com/percona/percona-backup-mongodb/x/pbm/storage/fs"
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 	"gopkg.in/yaml.v2"
 )
