@@ -248,6 +248,46 @@ func TestToClientLogMode(t *testing.T) {
 			expected: aws.LogSigning,
 		},
 		{
+			name:     "Single flag: Retries",
+			input:    "Retries",
+			expected: aws.LogRetries,
+		},
+		{
+			name:     "Single flag: Request",
+			input:    "Request",
+			expected: aws.LogRequest,
+		},
+		{
+			name:     "Single flag: RequestWithBody",
+			input:    "RequestWithBody",
+			expected: aws.LogRequestWithBody,
+		},
+		{
+			name:     "Single flag: Response",
+			input:    "Response",
+			expected: aws.LogResponse,
+		},
+		{
+			name:     "Single flag: ResponseWithBody",
+			input:    "ResponseWithBody",
+			expected: aws.LogResponseWithBody,
+		},
+		{
+			name:     "Single flag: DeprecatedUsage",
+			input:    "DeprecatedUsage",
+			expected: aws.LogDeprecatedUsage,
+		},
+		{
+			name:     "Single flag: RequestEventMessage",
+			input:    "RequestEventMessage",
+			expected: aws.LogRequestEventMessage,
+		},
+		{
+			name:     "Single flag: ResponseEventMessage",
+			input:    "ResponseEventMessage",
+			expected: aws.LogResponseEventMessage,
+		},
+		{
 			name:     "Multiple flags with commas",
 			input:    "Retries, Request, Response",
 			expected: aws.LogRetries | aws.LogRequest | aws.LogResponse,
@@ -260,6 +300,21 @@ func TestToClientLogMode(t *testing.T) {
 		{
 			name:     "Deprecated HTTPBody",
 			input:    "HTTPBody",
+			expected: aws.LogRequestWithBody | aws.LogResponseWithBody,
+		},
+		{
+			name:     "Deprecated RequestRetries",
+			input:    "RequestRetries",
+			expected: aws.LogRetries,
+		},
+		{
+			name:     "Deprecated RequestErrors",
+			input:    "RequestErrors",
+			expected: aws.LogResponse,
+		},
+		{
+			name:     "Deprecated EventStreamBody",
+			input:    "EventStreamBody",
 			expected: aws.LogRequestWithBody | aws.LogResponseWithBody,
 		},
 		{

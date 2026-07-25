@@ -718,53 +718,53 @@ func toClientLogMode(levels string) aws.ClientLogMode {
 	for _, item := range items {
 		flag := strings.TrimSpace(item)
 
-		switch flag {
-		case "Signing":
+		switch SDKDebugLogLevel(flag) {
+		case Signing:
 			// v1 had "LogDebugWithSigning"
 			mode |= aws.LogSigning
 
-		case "Retries":
+		case Retries:
 			mode |= aws.LogRetries
 
-		case "Request":
+		case Request:
 			mode |= aws.LogRequest
 
-		case "RequestWithBody":
+		case RequestWithBody:
 			mode |= aws.LogRequestWithBody
 
-		case "Response":
+		case Response:
 			mode |= aws.LogResponse
 
-		case "ResponseWithBody":
+		case ResponseWithBody:
 			mode |= aws.LogResponseWithBody
 
-		case "DeprecatedUsage":
+		case DeprecatedUsage:
 			mode |= aws.LogDeprecatedUsage
 
-		case "RequestEventMessage":
+		case RequestEventMessage:
 			mode |= aws.LogRequestEventMessage
 
-		case "ResponseEventMessage":
+		case ResponseEventMessage:
 			mode |= aws.LogResponseEventMessage
 
 		// Mapping deprecated flags from v1 for backwards compatibility
-		case "LogDebug":
+		case LogDebug:
 			// v1 had "LogDebug"
 			mode |= aws.LogRequest | aws.LogResponse
 
-		case "HTTPBody":
+		case HTTPBody:
 			// v1 had "LogDebugWithHTTPBody"
 			mode |= aws.LogRequestWithBody | aws.LogResponseWithBody
 
-		case "RequestRetries":
+		case RequestRetries:
 			// v1 had "LogDebugWithRequestRetries"
 			mode |= aws.LogRetries
 
-		case "RequestErrors":
+		case RequestErrors:
 			// v1 had "LogDebugWithRequestErrors"
 			mode |= aws.LogResponse
 
-		case "EventStreamBody":
+		case EventStreamBody:
 			// v1 had "LogDebugWithEventStreamBody"
 			mode |= aws.LogRequestWithBody | aws.LogResponseWithBody
 		}
