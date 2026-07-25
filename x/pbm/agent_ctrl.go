@@ -7,6 +7,7 @@ import (
 	"log"
 
 	"github.com/percona/percona-backup-mongodb/x/pbm/api"
+	"github.com/percona/percona-backup-mongodb/x/pbm/backup"
 	"github.com/percona/percona-backup-mongodb/x/pbm/config"
 	"github.com/percona/percona-backup-mongodb/x/pbm/connect"
 	"github.com/percona/percona-backup-mongodb/x/pbm/disco"
@@ -47,7 +48,8 @@ func RunCtrlAgent(ctx context.Context, cfg *CtrlAgentConfig) error {
 	defer etcdSrv.Close()
 	log.Printf("ctrl-agent %s started control collection db", cfg.Name)
 
-	configSvc := config.New(etcdSrv.Client())
+	storageResyncer := backup.NewStorageResyncer(etcdSrv.Client())
+	configSvc := config.New(etcdSrv.Client(), storageResyncer)
 
 	// wire the status service before starting its loop
 	statusSvc.SetPublisher(d)

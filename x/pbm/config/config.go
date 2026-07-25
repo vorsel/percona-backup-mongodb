@@ -41,6 +41,12 @@ func (c *Config) String() string {
 	return string(b)
 }
 
+// IsSameStorage reports whether new configuration points at the same storage
+// instance as old configuration.
+func (c *Config) IsSameStorage(other *Config) bool {
+	return c.Storage.IsSameStorage(&other.Storage)
+}
+
 // Parse reads a YAML config document from r. It rejects unknown fields and
 // validates the storage section.
 func Parse(r io.Reader) (*Config, error) {

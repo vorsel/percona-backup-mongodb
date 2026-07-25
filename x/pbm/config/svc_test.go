@@ -44,7 +44,7 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func newTestSvc(t *testing.T) *Svc {
+func newTestSvc(t *testing.T) (*Svc, *resyncMock) {
 	t.Helper()
 
 	cli, err := clientv3.New(clientv3.Config{
@@ -60,7 +60,8 @@ func newTestSvc(t *testing.T) *Svc {
 		t.Fatalf("reset config keys: %v", err)
 	}
 
-	return New(cli)
+	mock := &resyncMock{}
+	return New(cli, mock), mock
 }
 
 func testConfig(name, path string) *Config {
@@ -73,14 +74,14 @@ func testConfig(name, path string) *Config {
 	}
 }
 
-func TestSave(t *testing.T) {
+func TestUpsert(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("creates new document", func(t *testing.T) {
-		svc := newTestSvc(t)
+		svc, _ := newTestSvc(t)
 
-		if err := svc.Save(ctx, testConfig("primary", "/backups/primary")); err != nil {
-			t.Fatalf("Save: %v", err)
+		if err := svc.Upsert(ctx, testConfig("primary", "/backups/primary")); err != nil {
+			t.Fatalf("Upsert: %v", err)
 		}
 
 		got, err := svc.Get(ctx, "primary")
@@ -99,15 +100,15 @@ func TestSave(t *testing.T) {
 	})
 
 	t.Run("replaces existing document", func(t *testing.T) {
-		svc := newTestSvc(t)
+		svc, _ := newTestSvc(t)
 
-		if err := svc.Save(ctx, testConfig("dup", "/a")); err != nil {
-			t.Fatalf("first Save: %v", err)
+		if err := svc.Upsert(ctx, testConfig("dup", "/a")); err != nil {
+			t.Fatalf("first Upsert: %v", err)
 		}
 
 		// A second Save replaces the whole document (create-or-replace).
-		if err := svc.Save(ctx, testConfig("dup", "/b")); err != nil {
-			t.Fatalf("second Save: %v", err)
+		if err := svc.Upsert(ctx, testConfig("dup", "/b")); err != nil {
+			t.Fatalf("second Upsert: %v", err)
 		}
 
 		got, err := svc.Get(ctx, "dup")
@@ -120,10 +121,10 @@ func TestSave(t *testing.T) {
 	})
 
 	t.Run("defaults empty name to main", func(t *testing.T) {
-		svc := newTestSvc(t)
+		svc, _ := newTestSvc(t)
 
-		if err := svc.Save(ctx, testConfig("", "/default")); err != nil {
-			t.Fatalf("Save: %v", err)
+		if err := svc.Upsert(ctx, testConfig("", "/default")); err != nil {
+			t.Fatalf("Upsert: %v", err)
 		}
 
 		got, err := svc.Get(ctx, "main")
@@ -136,11 +137,83 @@ func TestSave(t *testing.T) {
 	})
 }
 
+func TestSave(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("resyncs when no config existed before", func(t *testing.T) {
+		svc, mock := newTestSvc(t)
+
+		if err := svc.Save(ctx, testConfig("main", "/a")); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+
+		if len(mock.seen) != 1 {
+			t.Fatalf("resyncer calls = %d, want 1", len(mock.seen))
+		}
+		if got := mock.seen[0].Filesystem.Path; got != "/a" {
+			t.Errorf("resynced storage path = %q, want %q", got, "/a")
+		}
+	})
+
+	t.Run("resyncs when storage changes", func(t *testing.T) {
+		svc, mock := newTestSvc(t)
+
+		if err := svc.Save(ctx, testConfig("main", "/a")); err != nil {
+			t.Fatalf("first Save: %v", err)
+		}
+		if err := svc.Save(ctx, testConfig("main", "/b")); err != nil {
+			t.Fatalf("second Save: %v", err)
+		}
+
+		if len(mock.seen) != 2 {
+			t.Fatalf("resyncer calls = %d, want 2", len(mock.seen))
+		}
+		if got := mock.seen[1].Filesystem.Path; got != "/b" {
+			t.Errorf("resynced storage path = %q, want %q", got, "/b")
+		}
+	})
+
+	t.Run("skips resync when only non-storage params change", func(t *testing.T) {
+		svc, mock := newTestSvc(t)
+
+		if err := svc.Save(ctx, testConfig("main", "/a")); err != nil {
+			t.Fatalf("first Save: %v", err)
+		}
+
+		// Same storage path, different (non-storage) parameter.
+		cfg := testConfig("main", "/a")
+		cfg.PITR = &PITRConf{Enabled: true}
+		if err := svc.Save(ctx, cfg); err != nil {
+			t.Fatalf("second Save: %v", err)
+		}
+
+		if len(mock.seen) != 1 {
+			t.Fatalf("resyncer calls = %d, want 1 (storage unchanged)", len(mock.seen))
+		}
+	})
+
+	t.Run("persists the config", func(t *testing.T) {
+		svc, _ := newTestSvc(t)
+
+		if err := svc.Save(ctx, testConfig("main", "/a")); err != nil {
+			t.Fatalf("Save: %v", err)
+		}
+
+		got, err := svc.Get(ctx, "main")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if got.Storage.Filesystem == nil || got.Storage.Filesystem.Path != "/a" {
+			t.Errorf("Storage.Filesystem = %+v, want Path %q", got.Storage.Filesystem, "/a")
+		}
+	})
+}
+
 func TestGet(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("missing returns ErrNotFound", func(t *testing.T) {
-		svc := newTestSvc(t)
+		svc, _ := newTestSvc(t)
 
 		_, err := svc.Get(ctx, "ghost")
 		if !errors.Is(err, ErrNotFound) {
@@ -149,10 +222,10 @@ func TestGet(t *testing.T) {
 	})
 
 	t.Run("empty name resolves to main", func(t *testing.T) {
-		svc := newTestSvc(t)
+		svc, _ := newTestSvc(t)
 
-		if err := svc.Save(ctx, testConfig("main", "/default")); err != nil {
-			t.Fatalf("Save: %v", err)
+		if err := svc.Upsert(ctx, testConfig("main", "/default")); err != nil {
+			t.Fatalf("Upsert: %v", err)
 		}
 
 		got, err := svc.Get(ctx, "")
@@ -169,7 +242,7 @@ func TestGetAll(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("empty store returns empty slice", func(t *testing.T) {
-		svc := newTestSvc(t)
+		svc, _ := newTestSvc(t)
 
 		all, err := svc.GetAll(ctx)
 		if err != nil {
@@ -181,11 +254,11 @@ func TestGetAll(t *testing.T) {
 	})
 
 	t.Run("returns all ordered by name", func(t *testing.T) {
-		svc := newTestSvc(t)
+		svc, _ := newTestSvc(t)
 
 		for _, name := range []string{"c", "a", "b"} {
-			if err := svc.Save(ctx, testConfig(name, "/"+name)); err != nil {
-				t.Fatalf("Save %q: %v", name, err)
+			if err := svc.Upsert(ctx, testConfig(name, "/"+name)); err != nil {
+				t.Fatalf("Upsert %q: %v", name, err)
 			}
 		}
 
@@ -214,10 +287,10 @@ func TestDelete(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("removes existing document", func(t *testing.T) {
-		svc := newTestSvc(t)
+		svc, _ := newTestSvc(t)
 
-		if err := svc.Save(ctx, testConfig("tmp", "/a")); err != nil {
-			t.Fatalf("Save: %v", err)
+		if err := svc.Upsert(ctx, testConfig("tmp", "/a")); err != nil {
+			t.Fatalf("Upsert: %v", err)
 		}
 
 		if err := svc.Delete(ctx, "tmp"); err != nil {
@@ -230,11 +303,22 @@ func TestDelete(t *testing.T) {
 	})
 
 	t.Run("missing returns ErrNotFound", func(t *testing.T) {
-		svc := newTestSvc(t)
+		svc, _ := newTestSvc(t)
 
 		err := svc.Delete(ctx, "ghost")
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("Delete missing: got %v, want ErrNotFound", err)
 		}
 	})
+}
+
+// resyncMock is a storageResyncer that records the storages it is asked to
+// resync.
+type resyncMock struct {
+	seen []*StorageConf
+}
+
+func (s *resyncMock) Resync(_ context.Context, stg *StorageConf) error {
+	s.seen = append(s.seen, stg)
+	return nil
 }

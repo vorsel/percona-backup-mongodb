@@ -66,9 +66,15 @@ func newTestHandler(t *testing.T) http.Handler {
 	}
 
 	mux := http.NewServeMux()
-	newConfigHandler(config.New(cli)).registerRoutes(mux)
+	newConfigHandler(config.New(cli, noopResyncer{})).registerRoutes(mux)
 	return mux
 }
+
+// noopResyncer satisfies config's storage-resyncer dependency; these tests
+// exercise the HTTP layer, not backup resyncing.
+type noopResyncer struct{}
+
+func (noopResyncer) Resync(context.Context, *config.StorageConf) error { return nil }
 
 func serve(h http.Handler, r *http.Request) *httptest.ResponseRecorder {
 	rr := httptest.NewRecorder()

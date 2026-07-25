@@ -16,15 +16,22 @@ const (
 
 var ErrNotFound = errors.New("config not found")
 
+// storageResyncer rebuilds the backup metadata list so it matches the given
+// storage.
+type storageResyncer interface {
+	Resync(ctx context.Context, stg *StorageConf) error
+}
+
 // Svc is the configuration service.
 // It manages PBM's configuration documents persisted in etcd.
 type Svc struct {
-	ccDB *clientv3.Client
+	ccDB     *clientv3.Client
+	resyncer storageResyncer
 }
 
 // New creates a config service instance.
-func New(ccDB *clientv3.Client) *Svc {
-	return &Svc{ccDB: ccDB}
+func New(ccDB *clientv3.Client, resyncer storageResyncer) *Svc {
+	return &Svc{ccDB: ccDB, resyncer: resyncer}
 }
 
 // Get returns the config document under the given name, defaulting to
@@ -67,10 +74,35 @@ func (s *Svc) GetAll(ctx context.Context) ([]*Config, error) {
 	return out, nil
 }
 
-// Save stores a config document, creating it when absent and replacing it in
+// Save persists the config and keeps the backup list in sync with its storage.
+func (s *Svc) Save(ctx context.Context, cfg *Config) error {
+	if cfg.Name == "" {
+		cfg.Name = DefaultConfigName
+	}
+
+	oldCfg, err := s.Get(ctx, cfg.Name)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return errors.Wrap(err, "get current config")
+	}
+
+	if err := s.Upsert(ctx, cfg); err != nil {
+		return err
+	}
+
+	// if ther's no previous config, or the storage instance changed, do resync
+	if oldCfg == nil || !oldCfg.IsSameStorage(cfg) {
+		if err := s.resyncer.Resync(ctx, &cfg.Storage); err != nil {
+			return errors.Wrap(err, "sync backup list")
+		}
+	}
+
+	return nil
+}
+
+// Upsert stores a config document, creating it when absent and replacing it in
 // full when present. The document is identified by cfg.Name, defaulting to
 // DefaultConfigName when empty.
-func (s *Svc) Save(ctx context.Context, cfg *Config) error {
+func (s *Svc) Upsert(ctx context.Context, cfg *Config) error {
 	if cfg.Name == "" {
 		cfg.Name = DefaultConfigName
 	}
