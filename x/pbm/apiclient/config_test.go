@@ -10,8 +10,8 @@ import (
 	"testing"
 
 	"github.com/percona/percona-backup-mongodb/x/pbm/config"
+	"github.com/percona/percona-backup-mongodb/x/pbm/config/fs"
 	"github.com/percona/percona-backup-mongodb/x/pbm/storage"
-	"github.com/percona/percona-backup-mongodb/x/pbm/storage/fs"
 )
 
 func testConfig(name, path string) *config.Config {

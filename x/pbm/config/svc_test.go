@@ -12,9 +12,9 @@ import (
 
 	tcetcd "github.com/testcontainers/testcontainers-go/modules/etcd"
 
+	"github.com/percona/percona-backup-mongodb/x/pbm/config/fs"
 	"github.com/percona/percona-backup-mongodb/x/pbm/errors"
 	"github.com/percona/percona-backup-mongodb/x/pbm/storage"
-	"github.com/percona/percona-backup-mongodb/x/pbm/storage/fs"
 )
 
 const etcdImage = "gcr.io/etcd-development/etcd:v3.6.12"

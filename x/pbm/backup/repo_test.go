@@ -13,6 +13,7 @@ import (
 	tcetcd "github.com/testcontainers/testcontainers-go/modules/etcd"
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	fscfg "github.com/percona/percona-backup-mongodb/x/pbm/config/fs"
 	"github.com/percona/percona-backup-mongodb/x/pbm/defs"
 	"github.com/percona/percona-backup-mongodb/x/pbm/errors"
 	"github.com/percona/percona-backup-mongodb/x/pbm/storage"
@@ -71,7 +72,7 @@ func newTestRepoWithStorage(t *testing.T) (*Repo, storage.Storage) {
 		t.Fatalf("reset backup keys: %v", err)
 	}
 
-	stg, err := fs.New(&fs.Config{Path: t.TempDir()})
+	stg, err := fs.New(&fscfg.Config{Path: t.TempDir()})
 	if err != nil {
 		t.Fatalf("create fs storage: %v", err)
 	}
