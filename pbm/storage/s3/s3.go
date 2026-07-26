@@ -63,7 +63,7 @@ type Config struct {
 
 	// DebugLogLevels enables AWS SDK v2 debug logging modes. Available options:
 	// Signing, Retries, Request, RequestWithBody, Response, ResponseWithBody,
-	// DeprecatedUsage, RequestEventMessage, ResponseEventMessage.
+	// DeprecatedUsage.
 	// https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/aws#ClientLogMode
 	DebugLogLevels string `bson:"debugLogLevels,omitempty" json:"debugLogLevels,omitempty" yaml:"debugLogLevels,omitempty"`
 
@@ -89,15 +89,13 @@ type Retryer struct {
 type SDKDebugLogLevel string
 
 const (
-	Signing              SDKDebugLogLevel = "Signing"
-	Retries              SDKDebugLogLevel = "Retries"
-	Request              SDKDebugLogLevel = "Request"
-	RequestWithBody      SDKDebugLogLevel = "RequestWithBody"
-	Response             SDKDebugLogLevel = "Response"
-	ResponseWithBody     SDKDebugLogLevel = "ResponseWithBody"
-	DeprecatedUsage      SDKDebugLogLevel = "DeprecatedUsage"
-	RequestEventMessage  SDKDebugLogLevel = "RequestEventMessage"
-	ResponseEventMessage SDKDebugLogLevel = "ResponseEventMessage"
+	Signing          SDKDebugLogLevel = "Signing"
+	Retries          SDKDebugLogLevel = "Retries"
+	Request          SDKDebugLogLevel = "Request"
+	RequestWithBody  SDKDebugLogLevel = "RequestWithBody"
+	Response         SDKDebugLogLevel = "Response"
+	ResponseWithBody SDKDebugLogLevel = "ResponseWithBody"
+	DeprecatedUsage  SDKDebugLogLevel = "DeprecatedUsage"
 )
 
 type AWSsse struct {
@@ -729,12 +727,6 @@ func toClientLogMode(levels string) aws.ClientLogMode {
 
 		case DeprecatedUsage:
 			mode |= aws.LogDeprecatedUsage
-
-		case RequestEventMessage:
-			mode |= aws.LogRequestEventMessage
-
-		case ResponseEventMessage:
-			mode |= aws.LogResponseEventMessage
 		}
 	}
 

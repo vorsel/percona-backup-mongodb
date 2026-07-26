@@ -278,14 +278,14 @@ func TestToClientLogMode(t *testing.T) {
 			expected: aws.LogDeprecatedUsage,
 		},
 		{
-			name:     "Single flag: RequestEventMessage",
+			name:     "Unsupported RequestEventMessage",
 			input:    "RequestEventMessage",
-			expected: aws.LogRequestEventMessage,
+			expected: 0,
 		},
 		{
-			name:     "Single flag: ResponseEventMessage",
+			name:     "Unsupported ResponseEventMessage",
 			input:    "ResponseEventMessage",
-			expected: aws.LogResponseEventMessage,
+			expected: 0,
 		},
 		{
 			name:     "Multiple flags with commas",
@@ -320,7 +320,7 @@ func TestToClientLogMode(t *testing.T) {
 		{
 			name:     "Flags with extra spaces",
 			input:    "  Signing  ,   RequestEventMessage,ResponseEventMessage ",
-			expected: aws.LogSigning | aws.LogRequestEventMessage | aws.LogResponseEventMessage,
+			expected: aws.LogSigning,
 		},
 		{
 			name:     "Multiple unsupported flags combined",
