@@ -61,11 +61,10 @@ type Config struct {
 	// certificate chain and host name
 	InsecureSkipTLSVerify bool `bson:"insecureSkipTLSVerify" json:"insecureSkipTLSVerify" yaml:"insecureSkipTLSVerify"`
 
-	// DebugLogLevels enables AWS SDK debug logging (sub)levels. Available options:
-	// LogDebug, Signing, HTTPBody, RequestRetries, RequestErrors, EventStreamBody
-	//
-	// Any sub levels will enable LogDebug level accordingly to AWS SDK Go module behavior
-	// https://pkg.go.dev/github.com/aws/aws-sdk-go@v1.40.7/aws#LogLevelType
+	// DebugLogLevels enables AWS SDK v2 debug logging modes. Available options:
+	// Signing, Retries, Request, RequestWithBody, Response, ResponseWithBody,
+	// DeprecatedUsage, RequestEventMessage, ResponseEventMessage.
+	// https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/aws#ClientLogMode
 	DebugLogLevels string `bson:"debugLogLevels,omitempty" json:"debugLogLevels,omitempty" yaml:"debugLogLevels,omitempty"`
 
 	// Retryer is configuration for client.DefaultRetryer
@@ -99,12 +98,6 @@ const (
 	DeprecatedUsage      SDKDebugLogLevel = "DeprecatedUsage"
 	RequestEventMessage  SDKDebugLogLevel = "RequestEventMessage"
 	ResponseEventMessage SDKDebugLogLevel = "ResponseEventMessage"
-
-	LogDebug        SDKDebugLogLevel = "LogDebug"
-	HTTPBody        SDKDebugLogLevel = "HTTPBody"
-	RequestRetries  SDKDebugLogLevel = "RequestRetries"
-	RequestErrors   SDKDebugLogLevel = "RequestErrors"
-	EventStreamBody SDKDebugLogLevel = "EventStreamBody"
 )
 
 type AWSsse struct {
@@ -258,9 +251,6 @@ func (cfg *Config) GetMaxObjSizeGB() float64 {
 //
 // If the string is incorrect formatted, prints warnings to the io.Writer.
 // Passing nil as the io.Writer will discard any warnings.
-//
-// Deprecated log level values from v1 are supported for backwards
-// compatibility and are automatically mapped to their current equivalents.
 func SDKLogLevel(levels string, out io.Writer) aws.ClientLogMode {
 	if out == nil {
 		out = io.Discard
@@ -720,7 +710,6 @@ func toClientLogMode(levels string) aws.ClientLogMode {
 
 		switch SDKDebugLogLevel(flag) {
 		case Signing:
-			// v1 had "LogDebugWithSigning"
 			mode |= aws.LogSigning
 
 		case Retries:
@@ -746,27 +735,6 @@ func toClientLogMode(levels string) aws.ClientLogMode {
 
 		case ResponseEventMessage:
 			mode |= aws.LogResponseEventMessage
-
-		// Mapping deprecated flags from v1 for backwards compatibility
-		case LogDebug:
-			// v1 had "LogDebug"
-			mode |= aws.LogRequest | aws.LogResponse
-
-		case HTTPBody:
-			// v1 had "LogDebugWithHTTPBody"
-			mode |= aws.LogRequestWithBody | aws.LogResponseWithBody
-
-		case RequestRetries:
-			// v1 had "LogDebugWithRequestRetries"
-			mode |= aws.LogRetries
-
-		case RequestErrors:
-			// v1 had "LogDebugWithRequestErrors"
-			mode |= aws.LogResponse
-
-		case EventStreamBody:
-			// v1 had "LogDebugWithEventStreamBody"
-			mode |= aws.LogRequestWithBody | aws.LogResponseWithBody
 		}
 	}
 
