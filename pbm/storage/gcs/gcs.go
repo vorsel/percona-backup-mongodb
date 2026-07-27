@@ -326,7 +326,7 @@ func (g *GCS) FileStat(name string) (storage.FileInfo, error) {
 	}
 
 	inf := storage.FileInfo{
-		Name: attrs.Name,
+		Name: name,
 		Size: attrs.Size,
 	}
 
