@@ -46,6 +46,11 @@ func (c *Client) put(ctx context.Context, path string, body []byte) error {
 	return c.do(ctx, http.MethodPut, path, body, nil)
 }
 
+// post issues POST path with no body, expecting an empty 204 response.
+func (c *Client) post(ctx context.Context, path string) error {
+	return c.do(ctx, http.MethodPost, path, nil, nil)
+}
+
 // do issues the request against each endpoint in turn, following at most one
 // leader redirect per endpoint.
 func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {

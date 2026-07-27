@@ -40,3 +40,9 @@ func (c *Client) SetConfig(ctx context.Context, cfg *config.Config) error {
 	}
 	return c.put(ctx, "/config/"+name, body)
 }
+
+// ResyncConfig forces a backup-list resync for the named config via
+// POST /config/{name}/resync. It returns ErrNotFound when no such config exists.
+func (c *Client) ResyncConfig(ctx context.Context, name string) error {
+	return c.post(ctx, "/config/"+name+"/resync")
+}

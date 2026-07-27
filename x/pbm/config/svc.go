@@ -99,6 +99,21 @@ func (s *Svc) Save(ctx context.Context, cfg *Config) error {
 	return nil
 }
 
+// Resync rebuilds the backup metadata list to match the storage of the named
+// config, defaulting to DefaultConfigName when empty.
+func (s *Svc) Resync(ctx context.Context, name string) error {
+	cfg, err := s.Get(ctx, name)
+	if err != nil {
+		return err
+	}
+
+	if err := s.resyncer.Resync(ctx, &cfg.Storage); err != nil {
+		return errors.Wrap(err, "sync backup list")
+	}
+
+	return nil
+}
+
 // Upsert stores a config document, creating it when absent and replacing it in
 // full when present. The document is identified by cfg.Name, defaulting to
 // DefaultConfigName when empty.

@@ -24,8 +24,11 @@ func configCommand() *cobra.Command {
 	}
 
 	cmd.Flags().Bool("list", false, "List all configurations")
-	cmd.Flags().String("file", "", `Upload config from YAML file ("-" reads stdin)`)
+	cmd.Flags().String("file", "", "Upload config from YAML file")
+	cmd.Flags().Bool("force-resync", false, "Resync backup list with the current store")
 	cmd.MarkFlagsMutuallyExclusive("list", "file")
+	cmd.MarkFlagsMutuallyExclusive("list", "force-resync")
+	cmd.MarkFlagsMutuallyExclusive("file", "force-resync")
 
 	return cmd
 }
@@ -33,6 +36,7 @@ func configCommand() *cobra.Command {
 func runConfig(cmd *cobra.Command, args []string) error {
 	list, _ := cmd.Flags().GetBool("list")
 	file, _ := cmd.Flags().GetString("file")
+	forceResync, _ := cmd.Flags().GetBool("force-resync")
 
 	cli := apiclient.New(splitList(viper.GetString(apiEndpointsFlag)))
 	out := cmd.OutOrStdout()
@@ -54,6 +58,20 @@ func runConfig(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		return printConfigs(out, cfgs)
+
+	case forceResync:
+		name := config.DefaultConfigName
+		if len(args) > 0 {
+			name = args[0]
+		}
+		if err := cli.ResyncConfig(ctx, name); err != nil {
+			if errors.Is(err, apiclient.ErrNotFound) {
+				return fmt.Errorf("configuration %q not found", name)
+			}
+			return err
+		}
+		fmt.Fprintf(out, "backup list resync started for configuration %q\n", name)
+		return nil
 
 	default:
 		name := config.DefaultConfigName

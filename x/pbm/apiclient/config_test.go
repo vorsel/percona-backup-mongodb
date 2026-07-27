@@ -101,6 +101,37 @@ func TestSetConfig(t *testing.T) {
 	}
 }
 
+func TestResyncConfig(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	if err := New([]string{srv.URL}).ResyncConfig(context.Background(), "main"); err != nil {
+		t.Fatalf("ResyncConfig: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if gotPath != "/config/main/resync" {
+		t.Errorf("path = %s, want /config/main/resync", gotPath)
+	}
+}
+
+func TestResyncConfigNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "config not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	err := New([]string{srv.URL}).ResyncConfig(context.Background(), "xyz")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ResyncConfig: got %v, want ErrNotFound", err)
+	}
+}
+
 func TestSetConfigDefaultsName(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

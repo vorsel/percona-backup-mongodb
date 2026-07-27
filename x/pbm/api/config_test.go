@@ -227,3 +227,27 @@ func TestHandleDelete(t *testing.T) {
 		}
 	})
 }
+
+func TestHandleResync(t *testing.T) {
+	t.Run("existing", func(t *testing.T) {
+		h := newTestHandler(t)
+
+		if rr := serve(h, putReq(t, "main", testConfig("main", "/data"))); rr.Code != http.StatusNoContent {
+			t.Fatalf("PUT: code = %d, want 204", rr.Code)
+		}
+
+		rr := serve(h, httptest.NewRequest(http.MethodPost, "/config/main/resync", nil))
+		if rr.Code != http.StatusNoContent {
+			t.Fatalf("code = %d, want 204", rr.Code)
+		}
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		h := newTestHandler(t)
+
+		rr := serve(h, httptest.NewRequest(http.MethodPost, "/config/ghost/resync", nil))
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("code = %d, want 404", rr.Code)
+		}
+	})
+}

@@ -209,6 +209,44 @@ func TestSave(t *testing.T) {
 	})
 }
 
+func TestResync(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("resyncs storage", func(t *testing.T) {
+		svc, mock := newTestSvc(t)
+
+		if err := svc.Upsert(ctx, testConfig("main", "/a")); err != nil {
+			t.Fatalf("Upsert: %v", err)
+		}
+
+		// Two resyncs of the same, unchanged storage must both run.
+		if err := svc.Resync(ctx, "main"); err != nil {
+			t.Fatalf("first Resync: %v", err)
+		}
+		if err := svc.Resync(ctx, "main"); err != nil {
+			t.Fatalf("second Resync: %v", err)
+		}
+
+		if len(mock.seen) != 2 {
+			t.Fatalf("resyncer calls = %d, want 2", len(mock.seen))
+		}
+		if got := mock.seen[1].Filesystem.Path; got != "/a" {
+			t.Errorf("resynced storage path = %q, want %q", got, "/a")
+		}
+	})
+
+	t.Run("missing config returns ErrNotFound and skips resync", func(t *testing.T) {
+		svc, mock := newTestSvc(t)
+
+		if err := svc.Resync(ctx, "ghost"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Resync missing: got %v, want ErrNotFound", err)
+		}
+		if len(mock.seen) != 0 {
+			t.Fatalf("resyncer calls = %d, want 0", len(mock.seen))
+		}
+	})
+}
+
 func TestGet(t *testing.T) {
 	ctx := context.Background()
 
