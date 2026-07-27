@@ -6,12 +6,13 @@ import (
 	"io"
 	"maps"
 
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
+	"gopkg.in/yaml.v2"
+
 	"github.com/percona/percona-backup-mongodb/x/pbm/compress"
 	"github.com/percona/percona-backup-mongodb/x/pbm/config/fs"
 	"github.com/percona/percona-backup-mongodb/x/pbm/errors"
 	"github.com/percona/percona-backup-mongodb/x/pbm/storage"
-	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
-	"gopkg.in/yaml.v2"
 )
 
 var (
