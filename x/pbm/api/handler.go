@@ -5,17 +5,18 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/percona/percona-backup-mongodb/x/pbm/backup"
 	"github.com/percona/percona-backup-mongodb/x/pbm/config"
 	"github.com/percona/percona-backup-mongodb/x/pbm/status"
 )
 
 // NewRouter builds the web API routes.
-func NewRouter(statusSvc *status.Svc, configSvc *config.Svc) http.Handler {
+func NewRouter(statusSvc *status.Svc, configSvc *config.Svc, backupRepo *backup.Repo) http.Handler {
 	mux := http.NewServeMux()
 
 	newStatusHandler(statusSvc).registerRoutes(mux)
 	newConfigHandler(configSvc).registerRoutes(mux)
-	// newBackupHandler(backupSvc).registerRoutes(mux)
+	newBackupHandler(backupRepo).registerRoutes(mux)
 
 	return leaderOnly(statusSvc, mux)
 }

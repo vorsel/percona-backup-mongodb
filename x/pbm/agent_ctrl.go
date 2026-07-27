@@ -51,12 +51,18 @@ func RunCtrlAgent(ctx context.Context, cfg *CtrlAgentConfig) error {
 	storageResyncer := backup.NewStorageResyncer(etcdSrv.Client())
 	configSvc := config.New(etcdSrv.Client(), storageResyncer)
 
+	// todo: rafactor to use single instance storage
+	backupRepo := backup.New(etcdSrv.Client(), nil)
+
 	// wire the status service before starting its loop
 	statusSvc.SetPublisher(d)
 	statusSvc.SetLeaderChecker(etcdSrv)
 	go statusSvc.Run(ctx)
 
-	apiSrv := api.Start(api.Config{Port: cfg.APISrvPort}, api.NewRouter(statusSvc, configSvc))
+	apiSrv := api.Start(
+		api.Config{Port: cfg.APISrvPort},
+		api.NewRouter(statusSvc, configSvc, backupRepo),
+	)
 	log.Printf("ctrl-agent %s started REST API on port %d", cfg.Name, cfg.APISrvPort)
 
 	select {

@@ -48,6 +48,7 @@ func main() {
 
 	rootCmd := rootCommand()
 	rootCmd.AddCommand(backupCommand())
+	rootCmd.AddCommand(listCommand())
 	rootCmd.AddCommand(statusCommand())
 	rootCmd.AddCommand(configCommand())
 	rootCmd.AddCommand(versionCommand())
