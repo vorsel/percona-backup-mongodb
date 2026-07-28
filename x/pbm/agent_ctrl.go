@@ -48,11 +48,9 @@ func RunCtrlAgent(ctx context.Context, cfg *CtrlAgentConfig) error {
 	defer etcdSrv.Close()
 	log.Printf("ctrl-agent %s started control collection db", cfg.Name)
 
-	storageResyncer := backup.NewStorageResyncer(etcdSrv.Client())
+	backupRepo := backup.New(etcdSrv.Client())
+	storageResyncer := backup.NewStorageResyncer(backupRepo)
 	configSvc := config.New(etcdSrv.Client(), storageResyncer)
-
-	// todo: rafactor to use single instance storage
-	backupRepo := backup.New(etcdSrv.Client(), nil)
 
 	// wire the status service before starting its loop
 	statusSvc.SetPublisher(d)
