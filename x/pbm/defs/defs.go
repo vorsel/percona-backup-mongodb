@@ -9,7 +9,8 @@ import (
 )
 
 const (
-	DB = "admin"
+	DB          = "admin"
+	MaxBSONSize = 16 * 1024 * 1024 // 16MB - maximum BSON document size
 )
 
 const (

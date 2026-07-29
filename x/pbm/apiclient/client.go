@@ -2,20 +2,24 @@
 package apiclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/percona/percona-backup-mongodb/x/pbm/api"
-	"github.com/percona/percona-backup-mongodb/x/pbm/status"
 )
 
 // requestTimeout bounds a single HTTP request to a ctrl-agent.
 const requestTimeout = 5 * time.Second
+
+// ErrNotFound is returned when the requested resource does not exist (HTTP 404).
+var ErrNotFound = errors.New("not found")
 
 // Client talks to the ctrl-agent web API, resolving the leader automatically.
 type Client struct {
@@ -32,21 +36,27 @@ func New(endpoints []string) *Client {
 	}
 }
 
-// Status fetches every cluster member from the leader's /status endpoint.
-func (c *Client) Status(ctx context.Context) ([]status.AgentInfo, error) {
-	var members []status.AgentInfo
-	if err := c.get(ctx, "/status", &members); err != nil {
-		return nil, err
-	}
-	return members, nil
+// get issues GET path, decoding a 200 response body into out.
+func (c *Client) get(ctx context.Context, path string, out any) error {
+	return c.do(ctx, http.MethodGet, path, nil, out)
 }
 
-// get issues GET path against each endpoint in turn, following at most one
-// leader redirect, and decodes a 200 response body into out.
-func (c *Client) get(ctx context.Context, path string, out any) error {
+// put issues PUT path with a JSON body, expecting an empty 204 response.
+func (c *Client) put(ctx context.Context, path string, body []byte) error {
+	return c.do(ctx, http.MethodPut, path, body, nil)
+}
+
+// post issues POST path with no body, expecting an empty 204 response.
+func (c *Client) post(ctx context.Context, path string) error {
+	return c.do(ctx, http.MethodPost, path, nil, nil)
+}
+
+// do issues the request against each endpoint in turn, following at most one
+// leader redirect per endpoint.
+func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {
 	var errs []error
 	for _, ep := range c.endpoints {
-		err := c.getFrom(ctx, normalizeEndpoint(ep), path, out, true)
+		err := c.doFrom(ctx, method, normalizeEndpoint(ep), path, body, out, true)
 		if err == nil {
 			return nil
 		}
@@ -58,12 +68,27 @@ func (c *Client) get(ctx context.Context, path string, out any) error {
 	return fmt.Errorf("all api endpoints failed: %w", errors.Join(errs...))
 }
 
-// getFrom issues GET base+path. On 421 it follows the leader redirect once
-// by using recursive call with redirect=false.
-func (c *Client) getFrom(ctx context.Context, base, path string, out any, redirect bool) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+// doFrom issues method base+path. On 421 it follows the leader redirect once
+// via a recursive call with redirect=false. A 200 body is decoded into out
+// (when non-nil); 204 is treated as success.
+func (c *Client) doFrom(
+	ctx context.Context,
+	method, base, path string,
+	body []byte,
+	out any,
+	redirect bool,
+) error {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, base+path, reader)
 	if err != nil {
 		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 
 	resp, err := c.http.Do(req)
@@ -74,9 +99,14 @@ func (c *Client) getFrom(ctx context.Context, base, path string, out any, redire
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			return fmt.Errorf("decode response: %w", err)
+		if out != nil {
+			if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+				return fmt.Errorf("decode response: %w", err)
+			}
 		}
+		return nil
+
+	case http.StatusNoContent:
 		return nil
 
 	case http.StatusMisdirectedRequest:
@@ -90,10 +120,13 @@ func (c *Client) getFrom(ctx context.Context, base, path string, out any, redire
 		if rr.Leader.Address == "" {
 			return errors.New("leader routing response missing address")
 		}
-		return c.getFrom(ctx, normalizeEndpoint(rr.Leader.Address), path, out, false)
+		return c.doFrom(ctx, method, normalizeEndpoint(rr.Leader.Address), path, body, out, false)
 
 	case http.StatusServiceUnavailable:
 		return errors.New("no leader elected yet")
+
+	case http.StatusNotFound:
+		return ErrNotFound
 
 	default:
 		return fmt.Errorf("unexpected status %s", resp.Status)
