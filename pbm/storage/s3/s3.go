@@ -5,7 +5,6 @@ import (
 	"crypto/md5"
 	"crypto/tls"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -200,6 +199,9 @@ func (cfg *Config) Cast() error {
 	if cfg == nil {
 		return errors.New("missing S3 configuration with S3 storage type")
 	}
+	if err := ValidateDebugLogLevels(cfg.DebugLogLevels); err != nil {
+		return errors.Wrap(err, "validate s3 debug log")
+	}
 	if cfg.Region == "" {
 		cfg.Region = defaultS3Region
 	}
@@ -243,35 +245,16 @@ func (cfg *Config) GetMaxObjSizeGB() float64 {
 	return defaultMaxObjSizeGB
 }
 
-// SDKLogLevel returns AWS SDK log level value from comma-separated
-// SDKDebugLogLevel values string. If the string does not contain a valid value,
-// returns 0 (logging is disabled).
-//
-// If the string is incorrect formatted, prints warnings to the io.Writer.
-// Passing nil as the io.Writer will discard any warnings.
-func SDKLogLevel(levels string, out io.Writer) aws.ClientLogMode {
-	if out == nil {
-		out = io.Discard
-	}
-
-	var logLevel aws.ClientLogMode
-
+// ValidateDebugLogLevels checks that all configured levels are supported.
+func ValidateDebugLogLevels(levels string) error {
 	for _, lvl := range strings.Split(levels, ",") {
 		lvl = strings.TrimSpace(lvl)
-		if lvl == "" {
-			continue
+		if lvl != "" && toClientLogMode(lvl) == 0 {
+			return errors.Errorf("unsupported S3 client debug log level %q", lvl)
 		}
-
-		l := toClientLogMode(lvl)
-		if l == 0 {
-			fmt.Fprintf(out, "Warning: S3 client debug log level: unsupported %q\n", lvl)
-			continue
-		}
-
-		logLevel |= l
 	}
 
-	return logLevel
+	return nil
 }
 
 //nolint:lll

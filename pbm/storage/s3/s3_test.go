@@ -95,13 +95,6 @@ func TestS3(t *testing.T) {
 		storage.RunStorageAPITests(t, stg)
 		storage.RunSplitMergeMWTests(t, stg)
 	})
-
-	t.Run("default SDKLogLevel for invalid value", func(t *testing.T) {
-		logLvl := SDKLogLevel("invalid", nil)
-		if logLvl != 0 {
-			t.Fatalf("expected SDKLogLevel to be 0, got %v", 0)
-		}
-	})
 }
 
 func TestConfig(t *testing.T) {
@@ -179,6 +172,17 @@ func TestConfig(t *testing.T) {
 
 		if opts.Region != "us-east-1" {
 			t.Error("Default value should be set on Cast")
+		}
+	})
+
+	t.Run("Cast rejects unsupported debug log levels", func(t *testing.T) {
+		for _, levels := range []string{"LogDebug", "RequestEventMessage", "Unknown"} {
+			t.Run(levels, func(t *testing.T) {
+				err := (&Config{DebugLogLevels: levels}).Cast()
+				if err == nil {
+					t.Fatal("expected error")
+				}
+			})
 		}
 	})
 
@@ -334,6 +338,51 @@ func TestToClientLogMode(t *testing.T) {
 			actual := toClientLogMode(tt.input)
 			if actual != tt.expected {
 				t.Errorf("toClientLogMode(%q) = %v, expected %v", tt.input, actual, tt.expected)
+			}
+		})
+	}
+}
+
+func TestValidateDebugLogLevels(t *testing.T) {
+	tests := []struct {
+		name    string
+		levels  string
+		wantErr bool
+	}{
+		{
+			name:   "empty",
+			levels: "",
+		},
+		{
+			name:   "supported",
+			levels: "Signing,Retries,Request,RequestWithBody,Response,ResponseWithBody,DeprecatedUsage",
+		},
+		{
+			name:   "spaces and empty items",
+			levels: " Signing, , Retries,",
+		},
+		{
+			name:    "legacy value",
+			levels:  "LogDebug",
+			wantErr: true,
+		},
+		{
+			name:    "event value",
+			levels:  "RequestEventMessage",
+			wantErr: true,
+		},
+		{
+			name:    "unknown value after supported value",
+			levels:  "Request,Unknown",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateDebugLogLevels(tt.levels)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateDebugLogLevels(%q) error = %v, wantErr %v", tt.levels, err, tt.wantErr)
 			}
 		})
 	}

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -629,12 +628,6 @@ func SetConfig(ctx context.Context, m connect.Client, cfg *Config) error {
 	}
 	sanitizeStoragePaths(&cfg.Storage)
 
-	if cfg.Storage.Type == storage.S3 {
-		// call the function for notification purpose.
-		// warning about unsupported levels will be printed
-		s3.SDKLogLevel(cfg.Storage.S3.DebugLogLevels, os.Stderr)
-	}
-
 	if cfg.PITR != nil {
 		if c := string(cfg.PITR.Compression); c != "" && !compress.IsValidCompressionType(c) {
 			return errors.Errorf("unsupported compression type: %q", c)
@@ -725,7 +718,9 @@ func SetConfigVar(ctx context.Context, m connect.Client, key, val string) error 
 			return errors.New("storage.filesystem.path can't be empty")
 		}
 	case "storage.s3.debugLogLevels":
-		s3.SDKLogLevel(v.(string), os.Stderr)
+		if err := s3.ValidateDebugLogLevels(v.(string)); err != nil {
+			return errors.Wrap(err, "set s3 debug log")
+		}
 	}
 
 	_, err = m.ConfigCollection().UpdateOne(ctx,
