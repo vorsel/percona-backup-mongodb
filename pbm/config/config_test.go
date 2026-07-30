@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/mongodb"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
@@ -618,6 +619,52 @@ func TestConfig(t *testing.T) {
 		})
 		require.Error(t, err)
 	})
+}
+
+func TestS3DebugLogLevelValidation(t *testing.T) {
+	ctx := context.Background()
+	newConfig := func(levels string) *Config {
+		return &Config{
+			Storage: StorageConf{
+				Type: storage.S3,
+				S3: &s3.Config{
+					Bucket:         "bucket",
+					DebugLogLevels: levels,
+				},
+			},
+		}
+	}
+
+	const validLevels = "Signing,Retries"
+	require.NoError(t, SetConfig(ctx, connClient, newConfig(validLevels)))
+	require.NoError(t, SetConfigVar(ctx, connClient, "storage.s3.debugLogLevels", "Request,Response"))
+
+	err := SetConfigVar(ctx, connClient, "storage.s3.debugLogLevels", "RequestEventMessage")
+	require.ErrorContains(t, err, "set s3 debug log")
+
+	err = SetConfig(ctx, connClient, newConfig("LogDebug"))
+	require.Error(t, err)
+
+	profile := newConfig("Unknown")
+	profile.Name = "invalid-debug-log-level"
+	profile.IsProfile = true
+	err = AddProfile(ctx, connClient, profile)
+	require.Error(t, err)
+
+	_, err = connClient.ConfigCollection().UpdateOne(ctx,
+		bson.D{{"profile", nil}},
+		bson.M{"$set": bson.M{"storage.s3.debugLogLevels": "Unknown"}},
+	)
+	require.NoError(t, err)
+
+	persisted, err := GetConfig(ctx, connClient)
+	require.NoError(t, err)
+	require.ErrorContains(t, persisted.Storage.Cast(), "validate s3 debug log")
+
+	require.NoError(t, SetConfigVar(ctx, connClient, "storage.s3.debugLogLevels", "Signing"))
+	got, err := GetConfigVar(ctx, connClient, "storage.s3.debugLogLevels")
+	require.NoError(t, err)
+	assert.Equal(t, "Signing", got)
 }
 
 func TestRestoreConfGetIndexCommitQuorum(t *testing.T) {
