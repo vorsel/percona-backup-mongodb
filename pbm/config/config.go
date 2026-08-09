@@ -5,17 +5,15 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"os"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 	"gopkg.in/yaml.v2"
 
 	"github.com/percona/percona-backup-mongodb/pbm/compress"
@@ -27,6 +25,7 @@ import (
 	"github.com/percona/percona-backup-mongodb/pbm/storage/fs"
 	"github.com/percona/percona-backup-mongodb/pbm/storage/gcs"
 	"github.com/percona/percona-backup-mongodb/pbm/storage/mio"
+	"github.com/percona/percona-backup-mongodb/pbm/storage/oci"
 	"github.com/percona/percona-backup-mongodb/pbm/storage/oss"
 	"github.com/percona/percona-backup-mongodb/pbm/storage/s3"
 	"github.com/percona/percona-backup-mongodb/pbm/topo"
@@ -50,7 +49,7 @@ func keys(t reflect.Type) confMap {
 		name := strings.TrimSpace(strings.Split(t.Field(i).Tag.Get("bson"), ",")[0])
 
 		typ := t.Field(i).Type
-		if typ.Kind() == reflect.Ptr {
+		if typ.Kind() == reflect.Pointer {
 			typ = typ.Elem()
 		}
 		if typ.Kind() == reflect.Struct {
@@ -96,8 +95,8 @@ type Config struct {
 	Backup  *BackupConf  `bson:"backup,omitempty" json:"backup,omitempty" yaml:"backup,omitempty"`
 	Restore *RestoreConf `bson:"restore,omitempty" json:"restore,omitempty" yaml:"restore,omitempty"`
 
-	Epoch     primitive.Timestamp `bson:"epoch" json:"-" yaml:"-"`
-	Lifecycle *LifecycleConf      `bson:"lifecycle,omitempty" json:"lifecycle,omitempty" yaml:"lifecycle,omitempty"`
+	Epoch     bson.Timestamp `bson:"epoch" json:"-" yaml:"-"`
+	Lifecycle *LifecycleConf `bson:"lifecycle,omitempty" json:"lifecycle,omitempty" yaml:"lifecycle,omitempty"`
 }
 
 func Parse(r io.Reader) (*Config, error) {
@@ -209,6 +208,7 @@ type StorageConf struct {
 	Azure      *azure.Config `bson:"azure,omitempty" json:"azure,omitempty" yaml:"azure,omitempty"`
 	Filesystem *fs.Config    `bson:"filesystem,omitempty" json:"filesystem,omitempty" yaml:"filesystem,omitempty"`
 	OSS        *oss.Config   `bson:"oss,omitempty" json:"oss,omitempty" yaml:"oss,omitempty"`
+	OCI        *oci.Config   `bson:"oci,omitempty" json:"oci,omitempty" yaml:"oci,omitempty"`
 }
 
 func (s *StorageConf) Clone() *StorageConf {
@@ -233,6 +233,8 @@ func (s *StorageConf) Clone() *StorageConf {
 		rv.GCS = s.GCS.Clone()
 	case storage.OSS:
 		rv.OSS = s.OSS.Clone()
+	case storage.OCI:
+		rv.OCI = s.OCI.Clone()
 	case storage.Blackhole: // no config
 	}
 
@@ -255,6 +257,8 @@ func (s *StorageConf) Equal(other *StorageConf) bool {
 		return s.GCS.Equal(other.GCS)
 	case storage.Filesystem:
 		return s.Filesystem.Equal(other.Filesystem)
+	case storage.OCI:
+		return s.OCI.Equal(other.OCI)
 	case storage.Blackhole:
 		return true
 	}
@@ -284,6 +288,8 @@ func (s *StorageConf) IsSameStorage(other *StorageConf) bool {
 		return s.OSS.IsSameStorage(other.OSS)
 	case storage.Filesystem:
 		return s.Filesystem.IsSameStorage(other.Filesystem)
+	case storage.OCI:
+		return s.OCI.IsSameStorage(other.OCI)
 	case storage.Blackhole:
 		return true
 	}
@@ -305,6 +311,8 @@ func (s *StorageConf) Cast() error {
 		return s.Azure.Cast()
 	case storage.GCS:
 		return s.GCS.Cast()
+	case storage.OCI:
+		return s.OCI.Cast()
 	case storage.Blackhole: // noop
 		return nil
 	}
@@ -324,6 +332,8 @@ func (s *StorageConf) Typ() string {
 		return "GCS"
 	case storage.OSS:
 		return "OSS"
+	case storage.OCI:
+		return "OCI"
 	case storage.Filesystem:
 		return "FS"
 	case storage.Blackhole:
@@ -391,6 +401,15 @@ func (s *StorageConf) Path() string {
 		if s.OSS.Prefix != "" {
 			path += "/" + s.OSS.Prefix
 		}
+	case storage.OCI:
+		path = "oci://"
+		if s.OCI.Namespace != "" {
+			path += s.OCI.Namespace + "/"
+		}
+		path += s.OCI.Bucket
+		if s.OCI.Prefix != "" {
+			path += "/" + s.OCI.Prefix
+		}
 	case storage.Filesystem:
 		path = s.Filesystem.Path
 	}
@@ -408,6 +427,8 @@ func (s *StorageConf) Region() string {
 		region = s.Minio.Region
 	case storage.OSS:
 		region = s.OSS.Region
+	case storage.OCI:
+		region = s.OCI.Region
 	}
 
 	return region
@@ -420,9 +441,11 @@ type RestoreConf struct {
 	// Logical restore
 	//
 	// num of documents to buffer
-	BatchSize              int `bson:"batchSize" json:"batchSize,omitempty" yaml:"batchSize,omitempty"`
-	NumInsertionWorkers    int `bson:"numInsertionWorkers" json:"numInsertionWorkers,omitempty" yaml:"numInsertionWorkers,omitempty"`
-	NumParallelCollections int `bson:"numParallelCollections" json:"numParallelCollections,omitempty" yaml:"numParallelCollections,omitempty"`
+	BatchSize              int               `bson:"batchSize" json:"batchSize,omitempty" yaml:"batchSize,omitempty"`
+	NumInsertionWorkers    int               `bson:"numInsertionWorkers" json:"numInsertionWorkers,omitempty" yaml:"numInsertionWorkers,omitempty"`
+	NumParallelCollections int               `bson:"numParallelCollections" json:"numParallelCollections,omitempty" yaml:"numParallelCollections,omitempty"`
+	NumParallelFiles       int               `bson:"numParallelFiles" json:"numParallelFiles,omitempty" yaml:"numParallelFiles,omitempty"`
+	IndexCommitQuorum      IndexCommitQuorum `bson:"indexCommitQuorum,omitempty" json:"indexCommitQuorum,omitempty" yaml:"indexCommitQuorum,omitempty"`
 
 	// NumDownloadWorkers sets the num of goroutine would be requesting chunks
 	// during the download. By default, it's set to GOMAXPROCS.
@@ -457,7 +480,7 @@ func (cfg *RestoreConf) Clone() *RestoreConf {
 	}
 	if cfg.Timeouts != nil {
 		rv.Timeouts = &RestoreTimeouts{
-			BalancerStopMin: cfg.Timeouts.BalancerStopMin,
+			BalancerStopSec: cfg.Timeouts.BalancerStopSec,
 		}
 	}
 
@@ -466,9 +489,9 @@ func (cfg *RestoreConf) Clone() *RestoreConf {
 
 //nolint:lll
 type RestoreTimeouts struct {
-	// BalancerStopMin is timeout (in minutes) to wait for the balancer to stop.
+	// BalancerStopSec is timeout (in seconds) to wait for the balancer to stop.
 	// 0 means wait indefinitely (default).
-	BalancerStopMin uint32 `bson:"balancerStopMin,omitempty" json:"balancerStopMin,omitempty" yaml:"balancerStopMin,omitempty"`
+	BalancerStopSec uint32 `bson:"balancerStop,omitempty" json:"balancerStop,omitempty" yaml:"balancerStop,omitempty"`
 }
 
 // BalancerStop returns timeout duration for waiting for the balancer to stop.
@@ -478,7 +501,7 @@ func (t *RestoreTimeouts) BalancerStop() time.Duration {
 		return 0
 	}
 
-	return time.Duration(t.BalancerStopMin) * time.Minute
+	return time.Duration(t.BalancerStopSec) * time.Second
 }
 
 // GetFallbackEnabled gets config's or default value for fallbackEnabled
@@ -497,6 +520,21 @@ func (cfg *RestoreConf) GetAllowPartlyDone() bool {
 	return true
 }
 
+func (cfg *RestoreConf) GetIndexCommitQuorum() IndexCommitQuorum {
+	if cfg != nil && cfg.IndexCommitQuorum != "" {
+		return cfg.IndexCommitQuorum
+	}
+
+	return DefaultRestoreIndexCommitQuorum
+}
+
+func (cfg *RestoreConf) GetNumParallelFiles() int {
+	if cfg == nil || cfg.NumParallelFiles < 1 {
+		return 1
+	}
+	return cfg.NumParallelFiles
+}
+
 //nolint:lll
 type BackupConf struct {
 	OplogSpanMin     float64                  `bson:"oplogSpanMin" json:"oplogSpanMin" yaml:"oplogSpanMin"`
@@ -506,6 +544,7 @@ type BackupConf struct {
 	CompressionLevel *int                     `bson:"compressionLevel,omitempty" json:"compressionLevel,omitempty" yaml:"compressionLevel,omitempty"`
 
 	NumParallelCollections int `bson:"numParallelCollections" json:"numParallelCollections,omitempty" yaml:"numParallelCollections,omitempty"`
+	NumParallelFiles       int `bson:"numParallelFiles" json:"numParallelFiles,omitempty" yaml:"numParallelFiles,omitempty"`
 }
 
 func (cfg *BackupConf) Clone() *BackupConf {
@@ -519,7 +558,7 @@ func (cfg *BackupConf) Clone() *BackupConf {
 	if cfg.Timeouts != nil {
 		rv.Timeouts = &BackupTimeouts{
 			Starting:        cfg.Timeouts.Starting,
-			BalancerStopMin: cfg.Timeouts.BalancerStopMin,
+			BalancerStopSec: cfg.Timeouts.BalancerStopSec,
 		}
 	}
 	if cfg.CompressionLevel != nil {
@@ -530,14 +569,21 @@ func (cfg *BackupConf) Clone() *BackupConf {
 	return &rv
 }
 
+func (cfg *BackupConf) GetNumParallelFiles() int {
+	if cfg == nil || cfg.NumParallelFiles < 1 {
+		return 1
+	}
+	return cfg.NumParallelFiles
+}
+
 //nolint:lll
 type BackupTimeouts struct {
 	// Starting is timeout (in seconds) to wait for a backup to start.
 	Starting *uint32 `bson:"startingStatus,omitempty" json:"startingStatus,omitempty" yaml:"startingStatus,omitempty"`
 
-	// BalancerStopMin is timeout (in minutes) to wait for the balancer to stop.
+	// BalancerStopSec is timeout (in seconds) to wait for the balancer to stop.
 	// 0 means wait indefinitely (default).
-	BalancerStopMin uint32 `bson:"balancerStopMin,omitempty" json:"balancerStopMin,omitempty" yaml:"balancerStopMin,omitempty"`
+	BalancerStopSec uint32 `bson:"balancerStop,omitempty" json:"balancerStop,omitempty" yaml:"balancerStop,omitempty"`
 }
 
 // StartingStatus returns timeout duration for .
@@ -557,7 +603,7 @@ func (t *BackupTimeouts) BalancerStop() time.Duration {
 		return 0
 	}
 
-	return time.Duration(t.BalancerStopMin) * time.Minute
+	return time.Duration(t.BalancerStopSec) * time.Second
 }
 
 func GetConfig(ctx context.Context, m connect.Client) (*Config, error) {
@@ -606,15 +652,14 @@ func SetConfig(ctx context.Context, m connect.Client, cfg *Config) error {
 	}
 	sanitizeStoragePaths(&cfg.Storage)
 
-	if cfg.Storage.Type == storage.S3 {
-		// call the function for notification purpose.
-		// warning about unsupported levels will be printed
-		s3.SDKLogLevel(cfg.Storage.S3.DebugLogLevels, os.Stderr)
-	}
-
 	if cfg.PITR != nil {
 		if c := string(cfg.PITR.Compression); c != "" && !compress.IsValidCompressionType(c) {
 			return errors.Errorf("unsupported compression type: %q", c)
+		}
+	}
+	if cfg.Restore != nil {
+		if err := ValidateIndexCommitQuorum(cfg.Restore.IndexCommitQuorum); err != nil {
+			return err
 		}
 	}
 
@@ -688,12 +733,18 @@ func SetConfigVar(ctx context.Context, m connect.Client, key, val string) error 
 		if c := v.(string); c != "" && !compress.IsValidCompressionType(c) {
 			return errors.Errorf("unsupported compression type: %q", c)
 		}
+	case "restore.indexCommitQuorum":
+		if err := ValidateIndexCommitQuorum(IndexCommitQuorum(v.(string))); err != nil {
+			return err
+		}
 	case "storage.filesystem.path":
 		if v.(string) == "" {
 			return errors.New("storage.filesystem.path can't be empty")
 		}
 	case "storage.s3.debugLogLevels":
-		s3.SDKLogLevel(v.(string), os.Stderr)
+		if err := s3.ValidateDebugLogLevels(v.(string)); err != nil {
+			return errors.Wrap(err, "set s3 debug log")
+		}
 	}
 
 	_, err = m.ConfigCollection().UpdateOne(ctx,
@@ -731,6 +782,11 @@ func sanitizeStoragePaths(s *StorageConf) {
 		if s.OSS != nil {
 			s.OSS.Bucket = storage.TrimSlashes(s.OSS.Bucket)
 			s.OSS.Prefix = storage.TrimSlashes(s.OSS.Prefix)
+		}
+	case storage.OCI:
+		if s.OCI != nil {
+			s.OCI.Bucket = storage.TrimSlashes(s.OCI.Bucket)
+			s.OCI.Prefix = storage.TrimSlashes(s.OCI.Prefix)
 		}
 	}
 }
@@ -808,10 +864,10 @@ func IsPITREnabled(ctx context.Context, m connect.Client) (bool, bool, error) {
 	return cfg.PITR.Enabled, cfg.PITR.OplogOnly, nil
 }
 
-type Epoch primitive.Timestamp
+type Epoch bson.Timestamp
 
-func (e Epoch) TS() primitive.Timestamp {
-	return primitive.Timestamp(e)
+func (e Epoch) TS() bson.Timestamp {
+	return bson.Timestamp(e)
 }
 
 func GetEpoch(ctx context.Context, m connect.Client) (Epoch, error) {

@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/percona/percona-backup-mongodb/pbm/config"
 	"github.com/percona/percona-backup-mongodb/pbm/ctrl"
@@ -91,6 +91,7 @@ func (a *Agent) handleAddConfigProfile(
 		err = errors.Wrap(err, "storage from config")
 		return
 	}
+	defer storage.Close(stg, l)
 
 	err = storage.HasReadAccess(ctx, stg)
 	if err != nil {

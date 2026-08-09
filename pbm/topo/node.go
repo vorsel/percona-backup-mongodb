@@ -2,14 +2,15 @@ package topo
 
 import (
 	"context"
+	"strconv"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
 	"github.com/percona/percona-backup-mongodb/pbm/errors"
+	"github.com/percona/percona-backup-mongodb/pbm/log"
 	"github.com/percona/percona-backup-mongodb/pbm/version"
 )
 
@@ -33,8 +34,8 @@ const (
 )
 
 type OpTime struct {
-	TS   primitive.Timestamp `bson:"ts" json:"ts"`
-	Term int64               `bson:"t" json:"t"`
+	TS   bson.Timestamp `bson:"ts" json:"ts"`
+	Term int64          `bson:"t" json:"t"`
 }
 
 // MongoLastWrite represents the last write to the MongoDB server
@@ -46,10 +47,10 @@ type MongoLastWrite struct {
 }
 
 type ClusterTime struct {
-	ClusterTime primitive.Timestamp `bson:"clusterTime"`
+	ClusterTime bson.Timestamp `bson:"clusterTime"`
 	Signature   struct {
-		Hash  primitive.Binary `bson:"hash"`
-		KeyID int64            `bson:"keyId"`
+		Hash  bson.Binary `bson:"hash"`
+		KeyID int64       `bson:"keyId"`
 	} `bson:"signature"`
 }
 
@@ -68,33 +69,33 @@ type NodeBrief struct {
 
 // NodeInfo represents the mongo's node info
 type NodeInfo struct {
-	Hosts                        []string             `bson:"hosts,omitempty"`
-	Msg                          string               `bson:"msg"`
-	MaxBsonObjectSise            int64                `bson:"maxBsonObjectSize"`
-	MaxMessageSizeBytes          int64                `bson:"maxMessageSizeBytes"`
-	MaxWriteBatchSize            int64                `bson:"maxWriteBatchSize"`
-	LocalTime                    time.Time            `bson:"localTime"`
-	LogicalSessionTimeoutMinutes int64                `bson:"logicalSessionTimeoutMinutes"`
-	MaxWireVersion               int64                `bson:"maxWireVersion"`
-	MinWireVersion               int64                `bson:"minWireVersion"`
-	OK                           int                  `bson:"ok"`
-	SetName                      string               `bson:"setName,omitempty"`
-	Primary                      string               `bson:"primary,omitempty"`
-	SetVersion                   int32                `bson:"setVersion,omitempty"`
-	IsPrimary                    bool                 `bson:"isWritablePrimary"`
-	Secondary                    bool                 `bson:"secondary,omitempty"`
-	Hidden                       bool                 `bson:"hidden,omitempty"`
-	Passive                      bool                 `bson:"passive,omitempty"`
-	ArbiterOnly                  bool                 `bson:"arbiterOnly"`
-	SecondaryDelayOld            int32                `bson:"slaveDelay"`
-	SecondaryDelaySecs           int32                `bson:"secondaryDelaySecs"`
-	ConfigSvr                    int                  `bson:"configsvr,omitempty"`
-	Me                           string               `bson:"me"`
-	LastWrite                    MongoLastWrite       `bson:"lastWrite"`
-	ClusterTime                  *ClusterTime         `bson:"$clusterTime,omitempty"`
-	ConfigServerState            *ConfigServerState   `bson:"$configServerState,omitempty"`
-	OperationTime                *primitive.Timestamp `bson:"operationTime,omitempty"`
-	Opts                         MongodOpts           `bson:"-"`
+	Hosts                        []string           `bson:"hosts,omitempty"`
+	Msg                          string             `bson:"msg"`
+	MaxBsonObjectSise            int64              `bson:"maxBsonObjectSize"`
+	MaxMessageSizeBytes          int64              `bson:"maxMessageSizeBytes"`
+	MaxWriteBatchSize            int64              `bson:"maxWriteBatchSize"`
+	LocalTime                    time.Time          `bson:"localTime"`
+	LogicalSessionTimeoutMinutes int64              `bson:"logicalSessionTimeoutMinutes"`
+	MaxWireVersion               int64              `bson:"maxWireVersion"`
+	MinWireVersion               int64              `bson:"minWireVersion"`
+	OK                           int                `bson:"ok"`
+	SetName                      string             `bson:"setName,omitempty"`
+	Primary                      string             `bson:"primary,omitempty"`
+	SetVersion                   int32              `bson:"setVersion,omitempty"`
+	IsPrimary                    bool               `bson:"isWritablePrimary"`
+	Secondary                    bool               `bson:"secondary,omitempty"`
+	Hidden                       bool               `bson:"hidden,omitempty"`
+	Passive                      bool               `bson:"passive,omitempty"`
+	ArbiterOnly                  bool               `bson:"arbiterOnly"`
+	SecondaryDelayOld            int32              `bson:"slaveDelay"`
+	SecondaryDelaySecs           int32              `bson:"secondaryDelaySecs"`
+	ConfigSvr                    int                `bson:"configsvr,omitempty"`
+	Me                           string             `bson:"me"`
+	LastWrite                    MongoLastWrite     `bson:"lastWrite"`
+	ClusterTime                  *ClusterTime       `bson:"$clusterTime,omitempty"`
+	ConfigServerState            *ConfigServerState `bson:"$configServerState,omitempty"`
+	OperationTime                *bson.Timestamp    `bson:"operationTime,omitempty"`
+	Opts                         MongodOpts         `bson:"-"`
 }
 
 func (i *NodeInfo) IsDelayed() bool {
@@ -260,6 +261,100 @@ func GetMongodOpts(ctx context.Context, m *mongo.Client, defaults *MongodOpts) (
 		return nil, errors.Wrap(err, "run mongo command")
 	}
 	return &opts.Parsed, nil
+}
+
+// ExpandSecOptsWithEncAtRest fetches missing encryption at rest settings from serverStatus,
+// and assign them to security options.
+// For KMIP, KeyIdentifier is assigned.
+// For Vault, SecretVersion is assigned.
+func ExpandSecOptsWithEncAtRest(
+	ctx context.Context,
+	m *mongo.Client,
+	secOpts *MongodOptsSec,
+	l log.LogEvent,
+) error {
+	if secOpts == nil || secOpts.EnableEncryption == nil || !*secOpts.EnableEncryption {
+		// encryption is not enabled
+		return nil
+	}
+
+	switch {
+	case secOpts.KMIP != nil:
+		encAtRestRaw, err := getEncryptionAtRest(ctx, m)
+		if err != nil {
+			return errors.Wrap(err, "get encryption at rest for kmip")
+		}
+		if encAtRestRaw.IsZero() {
+			l.Info("To store KMIP's keyIdentifier info within backup metadata, " +
+				"the latest PSMDB patch version is required.")
+			// backup should continue
+			return nil
+		}
+
+		var encAtRest struct {
+			EncryptionKeyId struct {
+				KMIP struct {
+					KeyID string `bson:"keyId,omitempty"`
+				} `bson:"kmip,omitempty"`
+			} `bson:"encryptionKeyId,omitempty"`
+		}
+		err = encAtRestRaw.Unmarshal(&encAtRest)
+		if err != nil {
+			return errors.Wrap(err, "unmarshal encryption at rest for kmip")
+		}
+
+		secOpts.KMIP.KeyIdentifier = &encAtRest.EncryptionKeyId.KMIP.KeyID
+
+	case secOpts.Vault != nil:
+		encAtRestRaw, err := getEncryptionAtRest(ctx, m)
+		if err != nil {
+			return errors.Wrap(err, "get encryption at rest for vault")
+		}
+		if encAtRestRaw.IsZero() {
+			l.Info("To store Vault's secretVersion info within backup metadata, " +
+				"the latest PSMDB patch version is required.")
+			// backup should continue
+			return nil
+		}
+
+		var encAtRest struct {
+			EncryptionKeyId struct {
+				Vault struct {
+					Version string `bson:"version,omitempty"`
+				} `bson:"vault,omitempty"`
+			} `bson:"encryptionKeyId,omitempty"`
+		}
+		err = encAtRestRaw.Unmarshal(&encAtRest)
+		if err != nil {
+			return errors.Wrap(err, "unmarshal encryption at rest for vault")
+		}
+
+		secretVersion, err := strconv.ParseUint(encAtRest.EncryptionKeyId.Vault.Version, 10, 32)
+		if err == nil {
+			// assign secretVersion only if it's number
+			ver := uint32(secretVersion)
+			secOpts.Vault.SecretVersion = &ver
+		}
+	}
+
+	return nil
+}
+
+// getEncryptionAtRest fetches polymorphic encryptionAtRest field from serverStatus.
+// For possible shapes of document fragment see: PSMDB-1633.
+func getEncryptionAtRest(ctx context.Context, m *mongo.Client) (*bson.RawValue, error) {
+	res := m.Database(defs.DB).RunCommand(ctx, bson.D{{"serverStatus", 1}})
+	if err := res.Err(); err != nil {
+		return nil, errors.Wrap(err, "cmd serverStatus")
+	}
+
+	raw, err := res.Raw()
+	if err != nil {
+		return nil, errors.Wrap(err, "bson serverStatus")
+	}
+
+	encAtRest := raw.Lookup("encryptionAtRest")
+	return &encAtRest, nil
 }
 
 //nolint:lll

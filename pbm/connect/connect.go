@@ -6,12 +6,12 @@ import (
 	"strings"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readconcern"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
-	"go.mongodb.org/mongo-driver/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
 	"github.com/percona/percona-backup-mongodb/pbm/errors"
@@ -150,7 +150,7 @@ func MongoConnectWithOpts(ctx context.Context,
 		}
 	}
 
-	conn, err := mongo.Connect(ctx, mopts)
+	conn, err := mongo.Connect(mopts)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "connect")
 	}
@@ -207,6 +207,7 @@ func UnsafeClient(m *mongo.Client) *clientImpl {
 // Connect resolves MongoDB connection to Primary member and wraps it within Client object.
 // In case of replica set it returns connection to Primary member,
 // while in case of sharded cluster it returns connection to Config RS Primary member.
+// Connections through mongos are not supported.
 func Connect(ctx context.Context, uri, appName string) (*clientImpl, error) {
 	client, opts, err := MongoConnectWithOpts(ctx, uri, AppName(appName))
 	if err != nil {
@@ -219,10 +220,8 @@ func Connect(ctx context.Context, uri, appName string) (*clientImpl, error) {
 		return nil, errors.Wrap(err, "get NodeInfo")
 	}
 	if inf.isMongos() {
-		return &clientImpl{
-			client:  client,
-			options: opts,
-		}, nil
+		_ = client.Disconnect(ctx)
+		return nil, ErrMongosUnsupported
 	}
 
 	inf.Opts, err = getMongodOpts(ctx, client, nil)
@@ -273,24 +272,6 @@ func Connect(ctx context.Context, uri, appName string) (*clientImpl, error) {
 	}, nil
 }
 
-func (l *clientImpl) HasValidConnection(ctx context.Context) error {
-	err := l.client.Ping(ctx, readpref.Primary())
-	if err != nil {
-		return err
-	}
-
-	info, err := getNodeInfo(ctx, l.client)
-	if err != nil {
-		return errors.Wrap(err, "get node info ext")
-	}
-
-	if !info.isMongos() && !info.isClusterLeader() {
-		return ErrInvalidConnection
-	}
-
-	return nil
-}
-
 func (l *clientImpl) Disconnect(ctx context.Context) error {
 	return l.client.Disconnect(ctx)
 }
@@ -307,7 +288,11 @@ func (l *clientImpl) ConfigDatabase() *mongo.Database {
 	return l.client.Database("config")
 }
 
-func (l *clientImpl) AdminCommand(ctx context.Context, cmd bson.D, opts ...*options.RunCmdOptions) *mongo.SingleResult {
+func (l *clientImpl) AdminCommand(
+	ctx context.Context,
+	cmd bson.D,
+	opts ...options.Lister[options.RunCmdOptions],
+) *mongo.SingleResult {
 	cmd = l.applyOptonsFromConnString(cmd)
 	return l.client.Database(defs.DB).RunCommand(ctx, cmd, opts...)
 }
@@ -364,8 +349,11 @@ func (l *clientImpl) applyOptonsFromConnString(cmd bson.D) bson.D {
 	cmdName := cmd[0].Key
 	switch cmdName {
 	case "create":
-		if l.options.WriteConcern != nil {
-			cmd = append(cmd, bson.E{"writeConcern", l.options.WriteConcern})
+		if wc := l.options.WriteConcern; wc != nil && wc.W != nil {
+			cmd = append(cmd, bson.E{
+				Key:   "writeConcern",
+				Value: bson.D{{Key: "w", Value: wc.W}},
+			})
 		}
 	default:
 		// do nothing for all other commands:
@@ -378,7 +366,7 @@ func (l *clientImpl) applyOptonsFromConnString(cmd bson.D) bson.D {
 	return cmd
 }
 
-var ErrInvalidConnection = errors.New("invalid mongo connection")
+var ErrMongosUnsupported = errors.New("mongos connection is not supported")
 
 type Client interface {
 	Disconnect(ctx context.Context) error
@@ -387,7 +375,7 @@ type Client interface {
 	MongoOptions() *options.ClientOptions
 
 	ConfigDatabase() *mongo.Database
-	AdminCommand(ctx context.Context, cmd bson.D, opts ...*options.RunCmdOptions) *mongo.SingleResult
+	AdminCommand(ctx context.Context, cmd bson.D, opts ...options.Lister[options.RunCmdOptions]) *mongo.SingleResult
 
 	LogCollection() *mongo.Collection
 	ConfigCollection() *mongo.Collection

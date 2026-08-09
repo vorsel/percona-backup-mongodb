@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,9 +14,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/mongodb"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 
 	"github.com/percona/percona-backup-mongodb/pbm/connect"
 	"github.com/percona/percona-backup-mongodb/pbm/storage"
@@ -23,6 +25,7 @@ import (
 	"github.com/percona/percona-backup-mongodb/pbm/storage/fs"
 	"github.com/percona/percona-backup-mongodb/pbm/storage/gcs"
 	"github.com/percona/percona-backup-mongodb/pbm/storage/mio"
+	ocistorage "github.com/percona/percona-backup-mongodb/pbm/storage/oci"
 	"github.com/percona/percona-backup-mongodb/pbm/storage/oss"
 	"github.com/percona/percona-backup-mongodb/pbm/storage/s3"
 )
@@ -287,6 +290,57 @@ func TestIsSameStorage(t *testing.T) {
 			t.Errorf("storage instances has different prefix: cfg=%+v, eq=%+v", cfg, neq)
 		}
 	})
+
+	t.Run("OCI", func(t *testing.T) {
+		cfg := &ocistorage.Config{
+			Region:    "eu-frankfurt-1",
+			Namespace: "ns1",
+			Bucket:    "b1",
+			Prefix:    "p1",
+			Credentials: ocistorage.Credentials{
+				Type: ocistorage.AuthTypeUserPrincipal,
+				UserPrincipal: &ocistorage.UserPrincipalCredentials{
+					Tenancy:     "t1",
+					User:        "u1",
+					Fingerprint: "f1",
+					PrivateKey:  "pk1",
+				},
+			},
+		}
+		eq := &ocistorage.Config{
+			Region:    "eu-frankfurt-1",
+			Namespace: "ns1",
+			Bucket:    "b1",
+			Prefix:    "p1",
+		}
+		if !cfg.IsSameStorage(eq) {
+			t.Errorf("config storage should identify the same instance: cfg=%+v, eq=%+v", cfg, eq)
+		}
+
+		neq := cfg.Clone()
+		neq.Region = "us-ashburn-1"
+		if cfg.IsSameStorage(neq) {
+			t.Errorf("storage instances has different region: cfg=%+v, eq=%+v", cfg, neq)
+		}
+
+		neq = cfg.Clone()
+		neq.Namespace = "ns2"
+		if cfg.IsSameStorage(neq) {
+			t.Errorf("storage instances has different namespace: cfg=%+v, eq=%+v", cfg, neq)
+		}
+
+		neq = cfg.Clone()
+		neq.Bucket = "b2"
+		if cfg.IsSameStorage(neq) {
+			t.Errorf("storage instances has different bucket: cfg=%+v, eq=%+v", cfg, neq)
+		}
+
+		neq = cfg.Clone()
+		neq.Prefix = "p2"
+		if cfg.IsSameStorage(neq) {
+			t.Errorf("storage instances has different prefix: cfg=%+v, eq=%+v", cfg, neq)
+		}
+	})
 }
 
 func TestCastError(t *testing.T) {
@@ -315,7 +369,7 @@ func TestMain(m *testing.M) {
 		log.Fatalf("conn string error: %v", err)
 	}
 	connStr += "&directConnection=true"
-	mClient, err := mongo.Connect(ctx, options.Client().ApplyURI(connStr))
+	mClient, err := mongo.Connect(options.Client().ApplyURI(connStr))
 	if err != nil {
 		log.Fatalf("mongo client connect error: %v", err)
 	}
@@ -353,8 +407,10 @@ func TestConfig(t *testing.T) {
 						ClientEmail: "ce1",
 						PrivateKey:  "pk1",
 					},
-					ChunkSize:    100,
-					MaxObjSizeGB: floatPtr(1.1),
+					ClientType:                gcs.ClientTypeJSON,
+					ChunkSize:                 100,
+					ParallelUploadConcurrency: 4,
+					MaxObjSizeGB:              floatPtr(1.1),
 					Retryer: &gcs.Retryer{
 						BackoffInitial:     11 * time.Minute,
 						BackoffMax:         111 * time.Minute,
@@ -395,6 +451,11 @@ func TestConfig(t *testing.T) {
 				desc:  "chunkSize",
 				param: "storage.gcs.chunkSize",
 				val:   fmt.Sprintf("%d", wantCfg.Storage.GCS.ChunkSize),
+			},
+			{
+				desc:  "parallelUploadConcurrency",
+				param: "storage.gcs.parallelUploadConcurrency",
+				val:   fmt.Sprintf("%d", wantCfg.Storage.GCS.ParallelUploadConcurrency),
 			},
 			{
 				desc:  "maxObjSizeGB",
@@ -458,6 +519,187 @@ func TestConfig(t *testing.T) {
 			}
 		})
 	})
+
+	t.Run("gcs parallel upload config", func(t *testing.T) {
+		emptyCfg := &Config{
+			Storage: StorageConf{Type: storage.GCS, GCS: &gcs.Config{}},
+		}
+		err := SetConfig(ctx, connClient, emptyCfg)
+		if err != nil {
+			t.Fatalf("setup: initial SetConfig failed: %v", err)
+		}
+
+		testCases := []struct {
+			desc  string
+			param string
+			val   string
+		}{
+			{
+				desc:  "clientType",
+				param: "storage.gcs.clientType",
+				val:   string(gcs.ClientTypeGRPC),
+			},
+			{
+				desc:  "parallelUploadConcurrency",
+				param: "storage.gcs.parallelUploadConcurrency",
+				val:   "4",
+			},
+		}
+
+		for _, tt := range testCases {
+			t.Run(tt.desc, func(t *testing.T) {
+				err := SetConfigVar(ctx, connClient, tt.param, tt.val)
+				if err != nil {
+					t.Fatalf("SetConfigVar failed for %s with value %s: %v",
+						tt.param, tt.val, err)
+				}
+			})
+		}
+
+		gotCfg, err := GetConfig(ctx, connClient)
+		if err != nil {
+			t.Fatalf("GetConfig failed: %v", err)
+		}
+
+		gotGCS := gotCfg.Storage.GCS
+		if gotGCS.ClientType != gcs.ClientTypeGRPC {
+			t.Fatalf("clientType: got=%q, want=%q", gotGCS.ClientType, gcs.ClientTypeGRPC)
+		}
+		if gotGCS.ParallelUploadConcurrency != 4 {
+			t.Fatalf("parallelUploadConcurrency: got=%d, want=4", gotGCS.ParallelUploadConcurrency)
+		}
+	})
+
+	t.Run("restore config", func(t *testing.T) {
+		emptyCfg := &Config{
+			Storage: StorageConf{Type: storage.Blackhole},
+		}
+		err := SetConfig(ctx, connClient, emptyCfg)
+		require.NoError(t, err)
+
+		testCases := []struct {
+			desc  string
+			param string
+			val   string
+			check func(t *testing.T, cfg *Config)
+		}{
+			{
+				desc:  "indexCommitQuorum",
+				param: "restore.indexCommitQuorum",
+				val:   string(IndexCommitQuorumMajority),
+				check: func(t *testing.T, cfg *Config) {
+					t.Helper()
+					require.NotNil(t, cfg.Restore)
+					assert.Equal(t, IndexCommitQuorumMajority, cfg.Restore.IndexCommitQuorum)
+				},
+			},
+		}
+
+		for _, tt := range testCases {
+			t.Run(tt.desc, func(t *testing.T) {
+				err := SetConfigVar(ctx, connClient, tt.param, tt.val)
+				require.NoError(t, err)
+
+				got, err := GetConfigVar(ctx, connClient, tt.param)
+				require.NoError(t, err)
+				assert.Equal(t, tt.val, got)
+
+				gotCfg, err := GetConfig(ctx, connClient)
+				require.NoError(t, err)
+				tt.check(t, gotCfg)
+			})
+		}
+
+		err = SetConfigVar(ctx, connClient, "restore.indexCommitQuorum", "whatever")
+		require.Error(t, err)
+
+		err = SetConfig(ctx, connClient, &Config{
+			Storage: StorageConf{Type: storage.Blackhole},
+			Restore: &RestoreConf{IndexCommitQuorum: "0"},
+		})
+		require.Error(t, err)
+	})
+}
+
+func TestS3DebugLogLevelValidation(t *testing.T) {
+	ctx := context.Background()
+	newConfig := func(levels string) *Config {
+		return &Config{
+			Storage: StorageConf{
+				Type: storage.S3,
+				S3: &s3.Config{
+					Bucket:         "bucket",
+					DebugLogLevels: levels,
+				},
+			},
+		}
+	}
+
+	const validLevels = "Signing,Retries"
+	require.NoError(t, SetConfig(ctx, connClient, newConfig(validLevels)))
+	require.NoError(t, SetConfigVar(ctx, connClient, "storage.s3.debugLogLevels", "Request,Response"))
+
+	err := SetConfigVar(ctx, connClient, "storage.s3.debugLogLevels", "RequestEventMessage")
+	require.ErrorContains(t, err, "set s3 debug log")
+
+	err = SetConfig(ctx, connClient, newConfig("LogDebug"))
+	require.Error(t, err)
+
+	profile := newConfig("Unknown")
+	profile.Name = "invalid-debug-log-level"
+	profile.IsProfile = true
+	err = AddProfile(ctx, connClient, profile)
+	require.Error(t, err)
+
+	_, err = connClient.ConfigCollection().UpdateOne(ctx,
+		bson.D{{"profile", nil}},
+		bson.M{"$set": bson.M{"storage.s3.debugLogLevels": "Unknown"}},
+	)
+	require.NoError(t, err)
+
+	persisted, err := GetConfig(ctx, connClient)
+	require.NoError(t, err)
+	require.ErrorContains(t, persisted.Storage.Cast(), "validate s3 debug log")
+
+	require.NoError(t, SetConfigVar(ctx, connClient, "storage.s3.debugLogLevels", "Signing"))
+	got, err := GetConfigVar(ctx, connClient, "storage.s3.debugLogLevels")
+	require.NoError(t, err)
+	assert.Equal(t, "Signing", got)
+}
+
+func TestRestoreConfGetIndexCommitQuorum(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *RestoreConf
+		want IndexCommitQuorum
+	}{
+		{name: "nil config", cfg: nil, want: DefaultRestoreIndexCommitQuorum},
+		{name: "empty value", cfg: &RestoreConf{}, want: DefaultRestoreIndexCommitQuorum},
+		{
+			name: "configured string value",
+			cfg:  &RestoreConf{IndexCommitQuorum: IndexCommitQuorumVotingMembers},
+			want: IndexCommitQuorumVotingMembers,
+		},
+		{name: "configured numeric value", cfg: &RestoreConf{IndexCommitQuorum: "3"}, want: "3"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.cfg.GetIndexCommitQuorum())
+		})
+	}
+}
+
+func TestParseRestoreIndexCommitQuorum(t *testing.T) {
+	cfg, err := Parse(strings.NewReader(`
+storage:
+  type: blackhole
+restore:
+  indexCommitQuorum: votingMembers
+`))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.Restore)
+	assert.Equal(t, IndexCommitQuorumVotingMembers, cfg.Restore.IndexCommitQuorum)
 }
 
 func TestSanitizeStoragePaths(t *testing.T) {
@@ -507,6 +749,11 @@ func TestSanitizeStoragePaths(t *testing.T) {
 			StorageConf{Type: storage.OSS, OSS: &oss.Config{Bucket: "bcp/", Prefix: "/pfx/"}},
 			"bcp", "pfx",
 		},
+		{
+			"oci trailing slash",
+			StorageConf{Type: storage.OCI, OCI: &ocistorage.Config{Bucket: "bcp/", Prefix: "/pfx/"}},
+			"bcp", "pfx",
+		},
 	}
 
 	for _, tt := range tests {
@@ -525,6 +772,9 @@ func TestSanitizeStoragePaths(t *testing.T) {
 			case storage.OSS:
 				assert.Equal(t, tt.wantBucket, tt.conf.OSS.Bucket)
 				assert.Equal(t, tt.wantPrefix, tt.conf.OSS.Prefix)
+			case storage.OCI:
+				assert.Equal(t, tt.wantBucket, tt.conf.OCI.Bucket)
+				assert.Equal(t, tt.wantPrefix, tt.conf.OCI.Prefix)
 			}
 		})
 	}
@@ -550,6 +800,8 @@ func TestIsStoragePathKey(t *testing.T) {
 		"storage.azure.prefix",
 		"storage.oss.bucket",
 		"storage.oss.prefix",
+		"storage.oci.bucket",
+		"storage.oci.prefix",
 	} {
 		assert.True(t, isStoragePathKey(key), "expected true for %q", key)
 	}
@@ -597,6 +849,50 @@ func TestSetConfigVarTrimsSlashes(t *testing.T) {
 			got, err := GetConfigVar(ctx, connClient, tt.key)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantVal, got)
+		})
+	}
+}
+
+func TestBackupConfGetNumParallelFiles(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *BackupConf
+		want int
+	}{
+		{name: "nil receiver", cfg: nil, want: 1},
+		{name: "unset (zero) defaults to 1", cfg: &BackupConf{}, want: 1},
+		{name: "negative defaults to 1", cfg: &BackupConf{NumParallelFiles: -5}, want: 1},
+		{name: "one", cfg: &BackupConf{NumParallelFiles: 1}, want: 1},
+		{name: "configured value", cfg: &BackupConf{NumParallelFiles: 8}, want: 8},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.GetNumParallelFiles(); got != tt.want {
+				t.Errorf("GetNumParallelFiles() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRestoreConfGetNumParallelFiles(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *RestoreConf
+		want int
+	}{
+		{name: "nil receiver", cfg: nil, want: 1},
+		{name: "unset (zero) defaults to 1", cfg: &RestoreConf{}, want: 1},
+		{name: "negative defaults to 1", cfg: &RestoreConf{NumParallelFiles: -5}, want: 1},
+		{name: "one", cfg: &RestoreConf{NumParallelFiles: 1}, want: 1},
+		{name: "configured value", cfg: &RestoreConf{NumParallelFiles: 8}, want: 8},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.GetNumParallelFiles(); got != tt.want {
+				t.Errorf("GetNumParallelFiles() = %d, want %d", got, tt.want)
+			}
 		})
 	}
 }

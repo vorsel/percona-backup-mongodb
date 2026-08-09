@@ -5,8 +5,8 @@ import (
 	"runtime"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/percona/percona-backup-mongodb/pbm/backup"
@@ -183,12 +183,16 @@ func (c *Client) getBackupHelper(
 func (c *Client) fillFilelistForBackup(ctx context.Context, bcp *BackupMetadata) error {
 	var err error
 	var stg storage.Storage
+	l := log.LogEventFromContext(ctx)
+	defer func() {
+		storage.Close(stg, l)
+	}()
 
 	eg, _ := errgroup.WithContext(ctx)
 	eg.SetLimit(runtime.NumCPU())
 
 	if version.HasFilelistFile(bcp.PBMVersion) {
-		stg, err = util.StorageFromConfig(&bcp.Store.StorageConf, c.node, log.LogEventFromContext(ctx))
+		stg, err = util.StorageFromConfig(&bcp.Store.StorageConf, c.node, l)
 		if err != nil {
 			return errors.Wrap(err, "get storage")
 		}
@@ -247,12 +251,14 @@ func (c *Client) fillFilelistForBackup(ctx context.Context, bcp *BackupMetadata)
 }
 
 func (c *Client) getStorageForRead(ctx context.Context, bcp *backup.BackupMeta) (storage.Storage, error) {
-	stg, err := util.StorageFromConfig(&bcp.Store.StorageConf, c.node, log.LogEventFromContext(ctx))
+	l := log.LogEventFromContext(ctx)
+	stg, err := util.StorageFromConfig(&bcp.Store.StorageConf, c.node, l)
 	if err != nil {
 		return nil, errors.Wrap(err, "get storage")
 	}
 	err = storage.HasReadAccess(ctx, stg)
 	if err != nil && !errors.Is(err, storage.ErrUninitialized) {
+		storage.Close(stg, l)
 		return nil, errors.Wrap(err, "check storage access")
 	}
 

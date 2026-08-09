@@ -14,9 +14,8 @@ import (
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/idx"
 	"github.com/mongodb/mongo-tools/mongorestore"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/percona/percona-backup-mongodb/pbm/archive"
 	"github.com/percona/percona-backup-mongodb/pbm/backup"
@@ -36,6 +35,8 @@ import (
 	"github.com/percona/percona-backup-mongodb/pbm/util"
 	"github.com/percona/percona-backup-mongodb/pbm/version"
 )
+
+const mongoErrUnsatisfiableCommitQuorum = 278
 
 // mDBCl represents mDB client iterface for the DB related ops.
 type mDBCl interface {
@@ -57,6 +58,7 @@ type Restore struct {
 
 	numParallelColls          int
 	numInsertionWorkersPerCol int
+	indexCommitQuorum         config.IndexCommitQuorum
 	// Shards to participate in restore. Num of shards in bcp could
 	// be less than in the cluster and this is ok. Only these shards
 	// would be expected to run restore (distributed transactions sync,
@@ -85,6 +87,22 @@ type oplogRange struct {
 	storage storage.Storage
 }
 
+type storageReadCloser struct {
+	r   io.ReadCloser
+	stg storage.Storage
+	l   log.LogEvent
+}
+
+func (rc storageReadCloser) Read(p []byte) (int, error) {
+	return rc.r.Read(p)
+}
+
+func (rc storageReadCloser) Close() error {
+	err := rc.r.Close()
+	storage.Close(rc.stg, rc.l)
+	return err
+}
+
 // configDatabasesDoc represents document in config.databases collection
 type configDatabasesDoc struct {
 	ID      string `bson:"_id"`
@@ -104,6 +122,7 @@ func New(
 	rsMap map[string]string,
 	numParallelColls,
 	numInsertionWorkersPerCol int,
+	indexCommitQuorum config.IndexCommitQuorum,
 ) *Restore {
 	if rsMap == nil {
 		rsMap = make(map[string]string)
@@ -120,6 +139,7 @@ func New(
 
 		numParallelColls:          numParallelColls,
 		numInsertionWorkersPerCol: numInsertionWorkersPerCol,
+		indexCommitQuorum:         indexCommitQuorum,
 		indexCatalog:              idx.NewIndexCatalog(),
 	}
 }
@@ -130,6 +150,12 @@ func (r *Restore) Close() {
 	if r.stopHB != nil {
 		close(r.stopHB)
 	}
+
+	storage.Close(r.bcpStg, r.log)
+	r.bcpStg = nil
+
+	storage.Close(r.oplogStg, r.log)
+	r.oplogStg = nil
 }
 
 func (r *Restore) exit(ctx context.Context, err error) {
@@ -142,6 +168,40 @@ func (r *Restore) exit(ctx context.Context, err error) {
 	}
 
 	r.Close()
+}
+
+// stopBalancer stops the balancer and waits for it to be fully disabled.
+// Uses the configured restore.timeouts.balancerStop if set.
+func (r *Restore) stopBalancer(ctx context.Context) error {
+	bs, err := topo.GetBalancerStatus(ctx, r.leadConn)
+	if err != nil {
+		return errors.Wrap(err, "get balancer status")
+	}
+
+	if bs.IsOn() {
+		t := r.cfg.Restore.Timeouts.BalancerStop()
+		if t > 0 {
+			r.log.Debug("stopping balancer with timeout %s", t)
+			err = topo.StopBalancer(ctx, r.leadConn, t.Milliseconds())
+		} else {
+			r.log.Debug("stopping balancer")
+			err = topo.SetBalancerStatus(ctx, r.leadConn, topo.BalancerModeOff)
+		}
+		if err != nil {
+			return errors.Wrap(err, "set balancer off")
+		}
+
+		r.log.Debug("waiting for balancer off")
+		bs := topo.WaitForBalancerDisabled(ctx, r.leadConn, time.Second*30, r.log)
+		if bs.IsDisabled() {
+			r.log.Debug("balancer is disabled")
+		} else {
+			r.log.Warning("balancer is not disabled: balancer mode: %s, in balancer round: %t",
+				bs.Mode, bs.InBalancerRound)
+		}
+	}
+
+	return nil
 }
 
 // resolveNamespace resolves final namespace(s) based on the backup namespace,
@@ -217,6 +277,12 @@ func (r *Restore) Snapshot(
 	err = r.init(ctx, cmd.Name, opid, l)
 	if err != nil {
 		return err
+	}
+
+	if r.brief.Sharded && r.nodeInfo.IsClusterLeader() {
+		if err := r.stopBalancer(ctx); err != nil {
+			return err
+		}
 	}
 
 	r.bcpStg, err = util.StorageFromConfig(&bcp.Store.StorageConf, r.brief.Me, r.log)
@@ -355,6 +421,12 @@ func (r *Restore) PITR(
 	err = r.init(ctx, cmd.Name, opid, l)
 	if err != nil {
 		return err
+	}
+
+	if r.brief.Sharded && r.nodeInfo.IsClusterLeader() {
+		if err := r.stopBalancer(ctx); err != nil {
+			return err
+		}
 	}
 
 	if bcp.LastWriteTS.Compare(cmd.OplogTS) >= 0 {
@@ -680,7 +752,7 @@ func (r *Restore) checkTopologyForOplog(currShards []topo.Shard, oplogShards []s
 // chunks defines chunks of oplog slice in given range, ensures its integrity (timeline
 // is contiguous - there are no gaps), checks for respective files on storage and returns
 // chunks list if all checks passed
-func (r *Restore) chunks(ctx context.Context, from, to primitive.Timestamp) ([]oplog.OplogChunk, error) {
+func (r *Restore) chunks(ctx context.Context, from, to bson.Timestamp) ([]oplog.OplogChunk, error) {
 	return chunks(ctx, r.leadConn, r.oplogStg, from, to, r.nodeInfo.SetName, r.rsMap)
 }
 
@@ -702,11 +774,13 @@ func LookupBackupMeta(
 		return nil, errors.Wrap(err, "get backup metadata from db")
 	}
 
+	l := log.LogEventFromContext(ctx)
 	var stg storage.Storage
-	stg, err = util.GetStorage(ctx, conn, node, log.LogEventFromContext(ctx))
+	stg, err = util.GetStorage(ctx, conn, node, l)
 	if err != nil {
 		return nil, errors.Wrap(err, "get storage")
 	}
+	defer storage.Close(stg, l)
 
 	bcp, err = GetMetaFromStore(stg, backupName)
 	if err != nil {
@@ -900,7 +974,7 @@ func (r *Restore) fullRestoreDBCleanup(ctx context.Context, bcp *backup.BackupMe
 
 		err = r.db.runCmdShardsvrDropDatabase(ctx, db, configDBDoc)
 		if err != nil {
-			return errors.Wrap(err, "full restore cleanup")
+			return errors.Wrap(err, "run cmd")
 		}
 		r.log.Debug("drop %q", db)
 	}
@@ -1025,11 +1099,14 @@ func (r *Restore) RunSnapshot(
 			// we have to use mapping passed by --replset-mapping option
 			rdr, err := stg.SourceReader(path.Join(bcp.Name, mapRS(r.brief.SetName), ns))
 			if err != nil {
+				storage.Close(stg, r.log)
 				return nil, err
 			}
 
 			if ns == archive.MetaFile {
 				data, err := io.ReadAll(rdr)
+				_ = rdr.Close()
+				storage.Close(stg, r.log)
 				if err != nil {
 					return nil, err
 				}
@@ -1039,10 +1116,10 @@ func (r *Restore) RunSnapshot(
 					return nil, errors.Wrap(err, "load indexes")
 				}
 
-				rdr = io.NopCloser(bytes.NewReader(data))
+				return io.NopCloser(bytes.NewReader(data)), nil
 			}
 
-			return rdr, nil
+			return storageReadCloser{r: rdr, stg: stg, l: r.log}, nil
 		},
 		bcp.Compression,
 		util.MakeSelectedPred(nss),
@@ -1268,21 +1345,49 @@ func (r *Restore) restoreIndexes(ctx context.Context, nss []string) error {
 			delete(index.Options, "v")
 		}
 
-		rawCommand := bson.D{
-			{"createIndexes", ns.Collection},
-			{"indexes", indexes},
-			{"ignoreUnknownIndexOptions", true},
-		}
+		commitQuorum := r.indexCommitQuorum.CommandValue()
+		rawCommand := createIndexesCommand(ns.Collection, indexes, commitQuorum)
 
 		r.log.Info("restoring indexes for %s.%s: %s",
 			ns.DB, ns.Collection, strings.Join(indexNames, ", "))
 		err := r.nodeConn.Database(ns.DB).RunCommand(ctx, rawCommand).Err()
+		if shouldRetryWithDefaultIndexCommitQuorum(err, commitQuorum) {
+			commitQuorum = config.DefaultRestoreIndexCommitQuorum.CommandValue()
+			r.log.Debug("createIndexes for %s.%s failed with MongoDB error: %v", ns.DB, ns.Collection, err)
+			r.log.Warning(
+				"index commit quorum cannot be satisfied for %s.%s, retrying with %s",
+				ns.DB, ns.Collection, commitQuorum,
+			)
+			rawCommand = createIndexesCommand(ns.Collection, indexes, commitQuorum)
+			err = r.nodeConn.Database(ns.DB).RunCommand(ctx, rawCommand).Err()
+		}
 		if err != nil {
 			return errors.Wrapf(err, "createIndexes for %s.%s", ns.DB, ns.Collection)
 		}
 	}
 
 	return nil
+}
+
+func createIndexesCommand(collection string, indexes []*idx.IndexDocument, commitQuorum any) bson.D {
+	return bson.D{
+		{"createIndexes", collection},
+		{"indexes", indexes},
+		{"ignoreUnknownIndexOptions", true},
+		{"commitQuorum", commitQuorum},
+	}
+}
+
+func shouldRetryWithDefaultIndexCommitQuorum(err error, commitQuorum any) bool {
+	if err == nil {
+		return false
+	}
+	if _, ok := commitQuorum.(int32); !ok {
+		return false
+	}
+
+	var cmdErr mongo.CommandError
+	return errors.As(err, &cmdErr) && cmdErr.HasErrorCode(mongoErrUnsatisfiableCommitQuorum)
 }
 
 func (r *Restore) updateRouterConfig(ctx context.Context) error {
@@ -1316,12 +1421,12 @@ func updateRouterTables(ctx context.Context, m connect.Client, sMap map[string]s
 func updateDatabasesRouterTable(ctx context.Context, m connect.Client, sMap map[string]string) error {
 	coll := m.ConfigDatabase().Collection("databases")
 
-	oldNames := make(primitive.A, 0, len(sMap))
+	oldNames := make(bson.A, 0, len(sMap))
 	for k := range sMap {
 		oldNames = append(oldNames, k)
 	}
 
-	q := primitive.M{"primary": primitive.M{"$in": oldNames}}
+	q := bson.M{"primary": bson.M{"$in": oldNames}}
 	cur, err := coll.Find(ctx, q)
 	if err != nil {
 		return errors.Wrap(err, "query")
@@ -1338,8 +1443,8 @@ func updateDatabasesRouterTable(ctx context.Context, m connect.Client, sMap map[
 		}
 
 		m := mongo.NewUpdateOneModel()
-		m.SetFilter(primitive.M{"_id": doc.ID})
-		m.SetUpdate(primitive.M{"$set": primitive.M{"primary": sMap[doc.Primary]}})
+		m.SetFilter(bson.M{"_id": doc.ID})
+		m.SetUpdate(bson.M{"$set": bson.M{"primary": sMap[doc.Primary]}})
 
 		models = append(models, m)
 	}
@@ -1357,12 +1462,12 @@ func updateDatabasesRouterTable(ctx context.Context, m connect.Client, sMap map[
 func updateChunksRouterTable(ctx context.Context, m connect.Client, sMap map[string]string) error {
 	coll := m.ConfigDatabase().Collection("chunks")
 
-	oldNames := make(primitive.A, 0, len(sMap))
+	oldNames := make(bson.A, 0, len(sMap))
 	for k := range sMap {
 		oldNames = append(oldNames, k)
 	}
 
-	q := primitive.M{"history.shard": primitive.M{"$in": oldNames}}
+	q := bson.M{"history.shard": bson.M{"$in": oldNames}}
 	cur, err := coll.Find(ctx, q)
 	if err != nil {
 		return errors.Wrap(err, "query")
@@ -1381,7 +1486,7 @@ func updateChunksRouterTable(ctx context.Context, m connect.Client, sMap map[str
 			return errors.Wrap(err, "decode")
 		}
 
-		updates := primitive.M{}
+		updates := bson.M{}
 		if n, ok := sMap[doc.Shard]; ok {
 			updates["shard"] = n
 		}
@@ -1393,8 +1498,8 @@ func updateChunksRouterTable(ctx context.Context, m connect.Client, sMap map[str
 		}
 
 		m := mongo.NewUpdateOneModel()
-		m.SetFilter(primitive.M{"_id": doc.ID})
-		m.SetUpdate(primitive.M{"$set": updates})
+		m.SetFilter(bson.M{"_id": doc.ID})
+		m.SetUpdate(bson.M{"$set": updates})
 		models = append(models, m)
 	}
 	if err := cur.Err(); err != nil {
@@ -1412,8 +1517,8 @@ func (r *Restore) setcommittedTxn(ctx context.Context, txn []phys.RestoreTxn) er
 	return RestoreSetRSTxn(ctx, r.leadConn, r.name, r.nodeInfo.SetName, txn)
 }
 
-func (r *Restore) getcommittedTxn(ctx context.Context) (map[string]primitive.Timestamp, error) {
-	txn := make(map[string]primitive.Timestamp)
+func (r *Restore) getcommittedTxn(ctx context.Context) (map[string]bson.Timestamp, error) {
+	txn := make(map[string]bson.Timestamp)
 
 	shards := make(map[string]struct{})
 	for _, s := range r.shards {

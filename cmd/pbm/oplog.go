@@ -11,7 +11,7 @@ import (
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
 	"github.com/percona/percona-backup-mongodb/pbm/errors"
 	"github.com/percona/percona-backup-mongodb/pbm/log"
-	"github.com/percona/percona-backup-mongodb/pbm/restore"
+	"github.com/percona/percona-backup-mongodb/pbm/storage"
 	"github.com/percona/percona-backup-mongodb/pbm/util"
 	"github.com/percona/percona-backup-mongodb/sdk"
 )
@@ -80,6 +80,7 @@ func replayOplog(
 	if err != nil {
 		return nil, errors.Wrap(err, "get storage")
 	}
+	defer storage.Close(stg, l)
 
 	name := time.Now().UTC().Format(time.RFC3339Nano)
 	cmd := ctrl.Cmd{
@@ -101,10 +102,7 @@ func replayOplog(
 
 	fmt.Printf("Starting oplog replay '%s - %s'", o.start, o.end)
 
-	startCtx, cancel := context.WithTimeout(ctx, defs.WaitActionStart)
-	defer cancel()
-
-	m, err := waitForRestoreStatus(startCtx, conn, name, restore.GetRestoreMeta)
+	m, err := waitForRestoreStatus(ctx, conn, stg, l, name, defs.LogicalBackup, 0)
 	if err != nil {
 		return nil, err
 	}

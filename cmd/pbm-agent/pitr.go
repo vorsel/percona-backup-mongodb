@@ -3,10 +3,11 @@ package main
 import (
 	"context"
 	"maps"
+	"sync/atomic"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/percona/percona-backup-mongodb/pbm/backup"
 	"github.com/percona/percona-backup-mongodb/pbm/config"
@@ -19,6 +20,7 @@ import (
 	"github.com/percona/percona-backup-mongodb/pbm/oplog"
 	"github.com/percona/percona-backup-mongodb/pbm/prio"
 	"github.com/percona/percona-backup-mongodb/pbm/slicer"
+	"github.com/percona/percona-backup-mongodb/pbm/storage"
 	"github.com/percona/percona-backup-mongodb/pbm/topo"
 	"github.com/percona/percona-backup-mongodb/pbm/util"
 )
@@ -37,9 +39,10 @@ const (
 )
 
 type currentPitr struct {
-	slicer *slicer.Slicer
-	w      chan ctrl.OPID // to wake up a slicer on demand (not to wait for the tick)
-	cancel context.CancelFunc
+	slicer      *slicer.Slicer
+	w           chan ctrl.OPID // to wake up a slicer on demand (not to wait for the tick)
+	bcpWakeSent atomic.Bool
+	cancel      context.CancelFunc
 }
 
 func (a *Agent) setPitr(p *currentPitr) {
@@ -154,7 +157,9 @@ func (a *Agent) sliceNow(opid ctrl.OPID) {
 		return
 	}
 
-	a.pitrjob.w <- opid
+	if opid == ctrl.NilOPID || a.pitrjob.bcpWakeSent.CompareAndSwap(false, true) {
+		a.pitrjob.w <- opid
+	}
 }
 
 // PITR starts PITR processing routine
@@ -165,7 +170,7 @@ func (a *Agent) PITR(ctx context.Context) {
 	for {
 		select {
 		case <-a.closeCMD:
-			l.Debug(string(ctrl.CmdPITR), "", "", primitive.Timestamp{}, "stopping main loop")
+			l.Debug(string(ctrl.CmdPITR), "", "", bson.Timestamp{}, "stopping main loop")
 			return
 		default:
 		}
@@ -362,6 +367,7 @@ func (a *Agent) pitr(ctx context.Context) error {
 		err = s.Catchup(ctx)
 	}
 	if err != nil {
+		storage.Close(stg, l)
 		if err := lck.Release(); err != nil {
 			l.Error("release lock: %v", err)
 		}
@@ -371,6 +377,7 @@ func (a *Agent) pitr(ctx context.Context) error {
 
 	go func() {
 		stopSlicingCtx, stopSlicing := context.WithCancel(ctx)
+		defer storage.Close(stg, l)
 		defer stopSlicing()
 		stopC := make(chan struct{})
 
@@ -868,6 +875,18 @@ func (a *Agent) pitrActivityMonitor(ctx context.Context) {
 				continue
 			}
 			if status != oplog.StatusRunning {
+				continue
+			}
+
+			// If any RS reported an error, let the error monitor handle it.
+			// Acting here would set StatusReconfig, masking the error and
+			// preventing proper error handling by the slicers on stop.
+			rsErrors, err := oplog.GetReplSetsWithStatus(ctx, a.leadConn, oplog.StatusError)
+			if err != nil && !errors.Is(err, errors.ErrNotFound) {
+				l.Error("activity check RS errors: %v", err)
+				continue
+			}
+			if len(rsErrors) > 0 {
 				continue
 			}
 

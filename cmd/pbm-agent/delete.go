@@ -5,7 +5,7 @@ import (
 	"runtime"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/percona/percona-backup-mongodb/pbm/backup"
@@ -98,6 +98,7 @@ func (a *Agent) Delete(ctx context.Context, d *ctrl.DeleteBackupCmd, opid ctrl.O
 			l.Error("get storage: %v", err)
 			return
 		}
+		defer storage.Close(stg, l)
 		l.Info("deleting backups older than %v %s", t, util.LogProfileArg(d.Profile))
 		err = backup.DeleteBackupBefore(ctx, a.leadConn, stg, d.Profile, bcpType, t)
 		if err != nil {
@@ -185,7 +186,7 @@ func (a *Agent) DeletePITR(ctx context.Context, d *ctrl.DeletePITRCmd, opid ctrl
 		return
 	}
 
-	ts := primitive.Timestamp{T: uint32(t.Unix())}
+	ts := bson.Timestamp{T: uint32(t.Unix())}
 	l.Info("deleting pitr chunks older than %v", t)
 	err = a.deletePITRImpl(ctx, ts)
 	if err != nil {
@@ -242,6 +243,12 @@ func (a *Agent) Cleanup(ctx context.Context, d *ctrl.CleanupCmd, opid ctrl.OPID,
 		}
 	}()
 
+	t := time.Unix(int64(d.OlderThan.T), 0).UTC()
+	obj := t.Format("2006-01-02T15:04:05Z")
+
+	l = logger.NewEvent(string(ctrl.CmdCleanup), obj, opid.String(), ep.TS())
+	ctx = log.SetLogEventToContext(ctx, l)
+
 	ct, err := topo.GetClusterTime(ctx, a.leadConn)
 	if err != nil {
 		l.Error("get cluster time: %v", err)
@@ -265,12 +272,15 @@ func (a *Agent) Cleanup(ctx context.Context, d *ctrl.CleanupCmd, opid ctrl.OPID,
 		l.Error("get storage: " + err.Error())
 		return
 	}
+	defer storage.Close(stg, l)
 
 	cr, err := backup.MakeCleanupInfo(ctx, a.leadConn, d.OlderThan, d.Profile)
 	if err != nil {
 		l.Error("make cleanup report: " + err.Error())
 		return
 	}
+
+	l.Info("deleting backups and pitr chunks older than %v %s", t, util.LogProfileArg(d.Profile))
 
 	eg := &errgroup.Group{}
 	eg.SetLimit(runtime.NumCPU())
@@ -284,7 +294,7 @@ func (a *Agent) Cleanup(ctx context.Context, d *ctrl.CleanupCmd, opid ctrl.OPID,
 	}
 }
 
-func (a *Agent) deletePITRImpl(ctx context.Context, ts primitive.Timestamp) error {
+func (a *Agent) deletePITRImpl(ctx context.Context, ts bson.Timestamp) error {
 	l := log.LogEventFromContext(ctx)
 
 	r, err := backup.MakeCleanupInfo(ctx, a.leadConn, ts, "")
@@ -300,6 +310,7 @@ func (a *Agent) deletePITRImpl(ctx context.Context, ts primitive.Timestamp) erro
 	if err != nil {
 		return errors.Wrap(err, "get storage")
 	}
+	defer storage.Close(stg, l)
 
 	eg := &errgroup.Group{}
 	eg.SetLimit(runtime.NumCPU())

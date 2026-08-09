@@ -8,10 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/percona/percona-backup-mongodb/pbm/archive"
@@ -28,6 +27,8 @@ import (
 	"github.com/percona/percona-backup-mongodb/pbm/version"
 )
 
+const namespaceStatsConcurrency = 50
+
 func (b *Backup) doLogical(
 	ctx context.Context,
 	bcp *ctrl.BackupCmd,
@@ -42,13 +43,21 @@ func (b *Backup) doLogical(
 			return errors.Wrap(err, "check for timeseries")
 		}
 	}
+	sizesStarted := time.Now()
 	nssSize, err := getNamespacesSize(ctx, b.nodeConn, bcp.Namespaces)
 	if err != nil {
 		return errors.Wrap(err, "get namespaces size")
 	}
-	if bcp.Compression == compress.CompressionTypeNone {
-		for n := range nssSize {
-			nssSize[n] *= 4
+	l.Info("got sizes of %d namespaces in %s", len(nssSize), time.Since(sizesStarted).Round(time.Millisecond))
+
+	sizeHints := make(map[string]int64, len(nssSize))
+	for ns, cs := range nssSize {
+		if bcp.Compression == compress.CompressionTypeNone {
+			// Uncompressed dump: the output size matches the logical BSON size.
+			sizeHints[ns] = cs.Size
+		} else {
+			// Compressed: WiredTiger on-disk size approximates compressed output.
+			sizeHints[ns] = cs.StorageSize
 		}
 	}
 
@@ -89,7 +98,7 @@ func (b *Backup) doLogical(
 		b.leadConn.MongoOptions().WriteConcern,
 		b.SlicerInterval(),
 		rsMeta.FirstWriteTS,
-		func(ctx context.Context, w io.WriterTo, from, till primitive.Timestamp) (int64, error) {
+		func(ctx context.Context, w io.WriterTo, from, till bson.Timestamp) (int64, error) {
 			filename := rsMeta.OplogName + "/" + FormatChunkName(from, till, bcp.Compression)
 
 			bytesPerSecond, err := getOplogBytesPerSecond(ctx, b.nodeConn)
@@ -107,7 +116,8 @@ func (b *Backup) doLogical(
 				estimatedSize = 1 << 30
 			}
 
-			return storage.Upload(ctx, w, stg, bcp.Compression, bcp.CompressionLevel, filename, int64(estimatedSize))
+			return storage.UploadWithOpts(ctx, w, stg, bcp.Compression, bcp.CompressionLevel, filename,
+				int64(estimatedSize), nil, nil)
 		})
 	// ensure slicer is stopped in any case (done, error or canceled)
 	defer stopOplogSlicer() //nolint:errcheck
@@ -192,8 +202,9 @@ func (b *Backup) doLogical(
 			if err != nil {
 				return errors.Wrap(err, "get storage")
 			}
+			defer storage.Close(stg, l)
 			filepath := path.Join(bcp.Name, rsMeta.Name, ns+ext)
-			return stg.Save(filepath, r, storage.Size(nssSize[ns]))
+			return stg.Save(filepath, r, storage.Size(sizeHints[ns]))
 		},
 		bcp.Compression,
 		bcp.CompressionLevel)
@@ -272,8 +283,8 @@ func dropTMPcoll(ctx context.Context, uri string) error {
 	return nil
 }
 
-func waitForWrite(ctx context.Context, m *mongo.Client, ts primitive.Timestamp) error {
-	var lw primitive.Timestamp
+func waitForWrite(ctx context.Context, m *mongo.Client, ts bson.Timestamp) error {
+	var lw bson.Timestamp
 	var err error
 
 	for i := 0; i < 21; i++ {
@@ -292,7 +303,7 @@ func waitForWrite(ctx context.Context, m *mongo.Client, ts primitive.Timestamp) 
 }
 
 //nolint:nonamedreturns
-func copyUsersNRolles(ctx context.Context, uri string, nss []string) (lastWrite primitive.Timestamp, err error) {
+func copyUsersNRolles(ctx context.Context, uri string, nss []string) (lastWrite bson.Timestamp, err error) {
 	cn, err := connect.MongoConnect(ctx, uri)
 	if err != nil {
 		return lastWrite, errors.Wrap(err, "connect to primary")
@@ -419,8 +430,19 @@ func makeConfigsvrDocFilter(nss []string, selector util.ChunkSelector) archive.D
 	}
 }
 
-func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string) (map[string]int64, error) {
-	rv := make(map[string]int64)
+// collSize holds the logical and on-disk sizes reported by collStats.
+type collSize struct {
+	Size        int64 `bson:"size"`        // uncompressed logical BSON data size
+	StorageSize int64 `bson:"storageSize"` // WiredTiger compressed on-disk size
+}
+
+func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string) (map[string]collSize, error) {
+	type namespace struct {
+		db   string
+		coll string
+	}
+
+	rv := make(map[string]collSize)
 
 	dbs, err := m.ListDatabaseNames(ctx, bson.D{})
 	if err != nil {
@@ -433,21 +455,21 @@ func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string) (map[
 	isSelected := util.MakeSelectedPred(nss)
 
 	mu := sync.Mutex{}
-	eg, ctx := errgroup.WithContext(ctx)
+	dbEg, dbCtx := errgroup.WithContext(ctx)
+	dbEg.SetLimit(namespaceStatsConcurrency)
 
+	var collections []namespace
 	for _, db := range dbs {
 		db := db
 
-		eg.Go(func() error {
-			res, err := m.Database(db).ListCollectionSpecifications(ctx, bson.D{})
+		dbEg.Go(func() error {
+			res, err := m.Database(db).ListCollectionSpecifications(dbCtx, bson.D{})
 			if err != nil {
 				return errors.Wrapf(err, "list collections for %q", db)
 			}
 			if len(res) == 0 {
 				return nil
 			}
-
-			eg, ctx := errgroup.WithContext(ctx)
 
 			for _, coll := range res {
 				if coll.Type == "view" || strings.HasPrefix(coll.Name, "system.buckets.") {
@@ -459,34 +481,48 @@ func getNamespacesSize(ctx context.Context, m *mongo.Client, nss []string) (map[
 					continue
 				}
 
-				eg.Go(func() error {
-					res := m.Database(db).RunCommand(ctx, bson.D{{"collStats", coll.Name}})
-					if err := res.Err(); err != nil {
-						return errors.Wrapf(err, "collStats %q", ns)
-					}
-
-					var doc struct {
-						StorageSize int64 `bson:"storageSize"`
-					}
-
-					if err := res.Decode(&doc); err != nil {
-						return errors.Wrapf(err, "decode %q", ns)
-					}
-
-					mu.Lock()
-					rv[ns] = doc.StorageSize
-					mu.Unlock()
-
-					return nil
-				})
+				mu.Lock()
+				collections = append(collections, namespace{db: db, coll: coll.Name})
+				mu.Unlock()
 			}
 
-			return eg.Wait()
+			return nil
 		})
 	}
 
-	err = eg.Wait()
-	return rv, err
+	dbErr := dbEg.Wait()
+	if dbErr != nil {
+		return rv, dbErr
+	}
+
+	rv = make(map[string]collSize, len(collections))
+	colEg, colCtx := errgroup.WithContext(ctx)
+	colEg.SetLimit(namespaceStatsConcurrency)
+
+	for _, ns := range collections {
+		name := ns.db + "." + ns.coll
+
+		colEg.Go(func() error {
+			res := m.Database(ns.db).RunCommand(colCtx, bson.D{{"collStats", ns.coll}})
+			if err := res.Err(); err != nil {
+				return errors.Wrapf(err, "collStats %q", name)
+			}
+
+			var doc collSize
+
+			if err := res.Decode(&doc); err != nil {
+				return errors.Wrapf(err, "decode %q", name)
+			}
+
+			mu.Lock()
+			rv[name] = doc
+			mu.Unlock()
+
+			return nil
+		})
+	}
+
+	return rv, colEg.Wait()
 }
 
 // getOplogBytesPerSecond returns the average number of bytes written to the
@@ -526,16 +562,16 @@ func getOplogBytesPerSecond(ctx context.Context, m *mongo.Client) (float64, erro
 }
 
 // oplogTimestamp returns the timestamp of the first (sort=1) or last (sort=-1) document in the oplog.
-func oplogTimestamp(ctx context.Context, coll *mongo.Collection, sort int) (primitive.Timestamp, error) {
+func oplogTimestamp(ctx context.Context, coll *mongo.Collection, sort int) (bson.Timestamp, error) {
 	var doc bson.M
 	err := coll.FindOne(ctx, bson.D{}, options.FindOne().SetSort(bson.D{{Key: "$natural", Value: sort}})).Decode(&doc)
 	if err != nil {
-		return primitive.Timestamp{}, errors.Wrap(err, "query oplog timestamp")
+		return bson.Timestamp{}, errors.Wrap(err, "query oplog timestamp")
 	}
 
-	ts, ok := doc["ts"].(primitive.Timestamp)
+	ts, ok := doc["ts"].(bson.Timestamp)
 	if !ok {
-		return primitive.Timestamp{}, errors.New("missing or invalid 'ts' field")
+		return bson.Timestamp{}, errors.New("missing or invalid 'ts' field")
 	}
 
 	return ts, nil
