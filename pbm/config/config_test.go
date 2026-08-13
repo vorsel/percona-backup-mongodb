@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/mongodb"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
@@ -406,8 +407,10 @@ func TestConfig(t *testing.T) {
 						ClientEmail: "ce1",
 						PrivateKey:  "pk1",
 					},
-					ChunkSize:    100,
-					MaxObjSizeGB: floatPtr(1.1),
+					ClientType:                gcs.ClientTypeJSON,
+					ChunkSize:                 100,
+					ParallelUploadConcurrency: 4,
+					MaxObjSizeGB:              floatPtr(1.1),
 					Retryer: &gcs.Retryer{
 						BackoffInitial:     11 * time.Minute,
 						BackoffMax:         111 * time.Minute,
@@ -448,6 +451,11 @@ func TestConfig(t *testing.T) {
 				desc:  "chunkSize",
 				param: "storage.gcs.chunkSize",
 				val:   fmt.Sprintf("%d", wantCfg.Storage.GCS.ChunkSize),
+			},
+			{
+				desc:  "parallelUploadConcurrency",
+				param: "storage.gcs.parallelUploadConcurrency",
+				val:   fmt.Sprintf("%d", wantCfg.Storage.GCS.ParallelUploadConcurrency),
 			},
 			{
 				desc:  "maxObjSizeGB",
@@ -512,6 +520,56 @@ func TestConfig(t *testing.T) {
 		})
 	})
 
+	t.Run("gcs parallel upload config", func(t *testing.T) {
+		emptyCfg := &Config{
+			Storage: StorageConf{Type: storage.GCS, GCS: &gcs.Config{}},
+		}
+		err := SetConfig(ctx, connClient, emptyCfg)
+		if err != nil {
+			t.Fatalf("setup: initial SetConfig failed: %v", err)
+		}
+
+		testCases := []struct {
+			desc  string
+			param string
+			val   string
+		}{
+			{
+				desc:  "clientType",
+				param: "storage.gcs.clientType",
+				val:   string(gcs.ClientTypeGRPC),
+			},
+			{
+				desc:  "parallelUploadConcurrency",
+				param: "storage.gcs.parallelUploadConcurrency",
+				val:   "4",
+			},
+		}
+
+		for _, tt := range testCases {
+			t.Run(tt.desc, func(t *testing.T) {
+				err := SetConfigVar(ctx, connClient, tt.param, tt.val)
+				if err != nil {
+					t.Fatalf("SetConfigVar failed for %s with value %s: %v",
+						tt.param, tt.val, err)
+				}
+			})
+		}
+
+		gotCfg, err := GetConfig(ctx, connClient)
+		if err != nil {
+			t.Fatalf("GetConfig failed: %v", err)
+		}
+
+		gotGCS := gotCfg.Storage.GCS
+		if gotGCS.ClientType != gcs.ClientTypeGRPC {
+			t.Fatalf("clientType: got=%q, want=%q", gotGCS.ClientType, gcs.ClientTypeGRPC)
+		}
+		if gotGCS.ParallelUploadConcurrency != 4 {
+			t.Fatalf("parallelUploadConcurrency: got=%d, want=4", gotGCS.ParallelUploadConcurrency)
+		}
+	})
+
 	t.Run("restore config", func(t *testing.T) {
 		emptyCfg := &Config{
 			Storage: StorageConf{Type: storage.Blackhole},
@@ -561,6 +619,52 @@ func TestConfig(t *testing.T) {
 		})
 		require.Error(t, err)
 	})
+}
+
+func TestS3DebugLogLevelValidation(t *testing.T) {
+	ctx := context.Background()
+	newConfig := func(levels string) *Config {
+		return &Config{
+			Storage: StorageConf{
+				Type: storage.S3,
+				S3: &s3.Config{
+					Bucket:         "bucket",
+					DebugLogLevels: levels,
+				},
+			},
+		}
+	}
+
+	const validLevels = "Signing,Retries"
+	require.NoError(t, SetConfig(ctx, connClient, newConfig(validLevels)))
+	require.NoError(t, SetConfigVar(ctx, connClient, "storage.s3.debugLogLevels", "Request,Response"))
+
+	err := SetConfigVar(ctx, connClient, "storage.s3.debugLogLevels", "RequestEventMessage")
+	require.ErrorContains(t, err, "set s3 debug log")
+
+	err = SetConfig(ctx, connClient, newConfig("LogDebug"))
+	require.Error(t, err)
+
+	profile := newConfig("Unknown")
+	profile.Name = "invalid-debug-log-level"
+	profile.IsProfile = true
+	err = AddProfile(ctx, connClient, profile)
+	require.Error(t, err)
+
+	_, err = connClient.ConfigCollection().UpdateOne(ctx,
+		bson.D{{"profile", nil}},
+		bson.M{"$set": bson.M{"storage.s3.debugLogLevels": "Unknown"}},
+	)
+	require.NoError(t, err)
+
+	persisted, err := GetConfig(ctx, connClient)
+	require.NoError(t, err)
+	require.ErrorContains(t, persisted.Storage.Cast(), "validate s3 debug log")
+
+	require.NoError(t, SetConfigVar(ctx, connClient, "storage.s3.debugLogLevels", "Signing"))
+	got, err := GetConfigVar(ctx, connClient, "storage.s3.debugLogLevels")
+	require.NoError(t, err)
+	assert.Equal(t, "Signing", got)
 }
 
 func TestRestoreConfGetIndexCommitQuorum(t *testing.T) {

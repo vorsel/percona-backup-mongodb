@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"time"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/server/v3/embed"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/v3client"
 )
 
 // Config holds embedded etcd server configuration.
@@ -106,6 +108,11 @@ func Start(ctx context.Context, name string, cfg Config) (*Server, error) {
 // IsLeader reports whether this node currently holds etcd leadership.
 func (s *Server) IsLeader() bool {
 	return s.srv.Server.Leader() == s.srv.Server.MemberID()
+}
+
+// Client returns an in-process client to this embedded etcd server.
+func (s *Server) Client() *clientv3.Client {
+	return v3client.New(s.srv.Server)
 }
 
 // Err returns fatal server errors after a successful Start.
