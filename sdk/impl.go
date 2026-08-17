@@ -352,6 +352,15 @@ func (c *Client) RunCleanup(ctx context.Context, beforeTS Timestamp, profile str
 	return CommandID(opid.String()), err
 }
 
+func (c *Client) RunLifecycleCleanup(
+	ctx context.Context,
+	lifecycleAt Timestamp,
+	profile string,
+) (CommandID, error) {
+	opid, err := ctrl.SendLifecycleCleanup(ctx, c.conn, lifecycleAt, profile)
+	return CommandID(opid.String()), err
+}
+
 func (c *Client) CancelBackup(ctx context.Context) (CommandID, error) {
 	opid, err := ctrl.SendCancelBackup(ctx, c.conn)
 	return CommandID(opid.String()), err

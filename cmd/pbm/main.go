@@ -15,7 +15,6 @@ import (
 
 	"github.com/percona/percona-backup-mongodb/pbm/backup"
 	"github.com/percona/percona-backup-mongodb/pbm/compress"
-	"github.com/percona/percona-backup-mongodb/pbm/config"
 	"github.com/percona/percona-backup-mongodb/pbm/connect"
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
 	"github.com/percona/percona-backup-mongodb/pbm/errors"
@@ -130,54 +129,19 @@ func (app *pbmApp) buildLifecycleCmd() *cobra.Command {
 		Short: "Manage backup retention and rotation lifecycle",
 		RunE: app.wrapRunE(func(cmd *cobra.Command, args []string) (fmt.Stringer, error) {
 
-			var cfg *config.Config
-			var err error
-
-			// 1. Fetch the correct configuration
-			if profile != "" {
-				cfg, err = config.GetProfile(app.ctx, app.conn, profile)
-				if err != nil {
-					return nil, errors.Wrap(err, "get profile config")
-				}
-			} else {
-				cfg, err = config.GetConfig(app.ctx, app.conn)
-				if err != nil {
-					return nil, errors.Wrap(err, "get config")
-				}
-			}
-
-			// 2. Fetch all backups
-			bcps, err := backup.BackupsList(app.ctx, app.conn, 0)
+			report, err := lifecycle.EvaluateProfile(
+				app.ctx, app.conn, profile, *dryRun, time.Now().UTC(),
+			)
 			if err != nil {
-				return nil, errors.Wrap(err, "fetch backups")
+				return nil, err
 			}
-
-			// 3. Filter backups to strictly match the targeted profile
-			var targetBcps []backup.BackupMeta
-			for _, b := range bcps {
-
-				storageProfile := b.Store.Name
-
-				if profile != "" && storageProfile != profile {
-					continue // Skip backups belonging to other profiles
-				}
-				if profile == "" && b.Store.IsProfile {
-					// Using b.Store.IsProfile is a bit safer than just checking if the name is blank,
-					// as it perfectly aligns with PBM's internal logic for identifying external profiles.
-					continue // If running default lifecycle, skip profile-specific backups
-				}
-				targetBcps = append(targetBcps, b)
-			}
-
-			// 4. Evaluate using only the targeted backups and config
-			report := lifecycle.Evaluate(*cfg.Lifecycle, targetBcps, *dryRun, time.Now().UTC())
 			isJSON := app.pbmOutF == outJSON || app.pbmOutF == outJSONpretty
 
 			if !isJSON {
 				fmt.Println(report.String())
 			}
 
-			if *dryRun || !cfg.Lifecycle.Enabled {
+			if *dryRun || !report.ConfigUsed.Enabled {
 				if isJSON {
 					return lifecycleResult{Report: report}, nil
 				}
@@ -193,13 +157,13 @@ func (app *pbmApp) buildLifecycleCmd() *cobra.Command {
 			}
 
 			minKeep := 1
-			if cfg.Lifecycle.MinKeep != nil {
-				minKeep = *cfg.Lifecycle.MinKeep
+			if report.ConfigUsed.MinKeep != nil {
+				minKeep = *report.ConfigUsed.MinKeep
 			}
 
 			shouldPrompt := true
-			if cfg.Lifecycle.Prompt != nil {
-				shouldPrompt = *cfg.Lifecycle.Prompt
+			if report.ConfigUsed.Prompt != nil {
+				shouldPrompt = *report.ConfigUsed.Prompt
 			}
 
 			if isJSON {
@@ -541,13 +505,16 @@ func (app *pbmApp) buildCleanupCmd() *cobra.Command {
 		Use:   "cleanup",
 		Short: "Delete Backups and PITR chunks",
 		RunE: app.wrapRunE(func(cmd *cobra.Command, args []string) (fmt.Stringer, error) {
-			return doCleanup(app.ctx, app.conn, app.pbm, &cleanupOpts)
+			return doCleanup(app.ctx, app.conn, app.pbm, &cleanupOpts, app.pbmOutF)
 		}),
 	}
 
 	cleanupCmd.Flags().StringVar(
 		&cleanupOpts.olderThan, "older-than", "",
 		fmt.Sprintf("Delete backups older than date/time in format %s or %s", datetimeFormat, dateFormat),
+	)
+	cleanupCmd.Flags().BoolVar(
+		&cleanupOpts.lifecycle, "lifecycle", false, "Delete backups according to the lifecycle policy",
 	)
 	cleanupCmd.Flags().BoolVarP(
 		&cleanupOpts.yes, "yes", "y", false, "Don't ask for confirmation",

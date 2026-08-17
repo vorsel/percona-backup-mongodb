@@ -29,6 +29,45 @@ func mockTypedBcp(name string, daysAgo int, baseTime time.Time, status defs.Stat
 	return bcp
 }
 
+func TestFilterBackupsByProfile(t *testing.T) {
+	backups := []backup.BackupMeta{
+		{Name: "main"},
+		{Name: "archive", Store: backup.Storage{Name: "archive", IsProfile: true}},
+		{Name: "other", Store: backup.Storage{Name: "other", IsProfile: true}},
+		{Name: "archive-by-name", Store: backup.Storage{Name: "archive"}},
+	}
+
+	tests := []struct {
+		name    string
+		profile string
+		want    []string
+	}{
+		{
+			name: "main storage",
+			want: []string{"main", "archive-by-name"},
+		},
+		{
+			name:    "named profile",
+			profile: "archive",
+			want:    []string{"archive", "archive-by-name"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := filterBackupsByProfile(backups, tt.profile)
+			gotNames := make([]string, len(got))
+			for i := range got {
+				gotNames[i] = got[i].Name
+			}
+
+			if !reflect.DeepEqual(gotNames, tt.want) {
+				t.Errorf("filterBackupsByProfile() = %v, want %v", gotNames, tt.want)
+			}
+		})
+	}
+}
+
 func TestEvaluate(t *testing.T) {
 	// Define a few specific dates we want to test against
 	standardDate := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)     // A normal Thursday

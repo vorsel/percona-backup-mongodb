@@ -15,6 +15,7 @@ import (
 	"github.com/percona/percona-backup-mongodb/pbm/ctrl"
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
 	"github.com/percona/percona-backup-mongodb/pbm/errors"
+	"github.com/percona/percona-backup-mongodb/pbm/lifecycle"
 	"github.com/percona/percona-backup-mongodb/pbm/oplog"
 	"github.com/percona/percona-backup-mongodb/pbm/storage"
 	"github.com/percona/percona-backup-mongodb/sdk"
@@ -258,6 +259,7 @@ func deletePITR(
 
 type cleanupOptions struct {
 	olderThan string
+	lifecycle bool
 	yes       bool
 	wait      bool
 	waitTime  time.Duration
@@ -265,7 +267,40 @@ type cleanupOptions struct {
 	profile   ProfileFlag
 }
 
-func doCleanup(ctx context.Context, conn connect.Client, pbm *sdk.Client, d *cleanupOptions) (fmt.Stringer, error) {
+func doCleanup(
+	ctx context.Context,
+	conn connect.Client,
+	pbm *sdk.Client,
+	d *cleanupOptions,
+	out outFormat,
+) (fmt.Stringer, error) {
+	if err := validateCleanupMode(d.olderThan, d.lifecycle); err != nil {
+		return nil, err
+	}
+	if d.lifecycle {
+		return doLifecycleCleanup(ctx, conn, pbm, d, out)
+	}
+
+	return doCleanupOlderThan(ctx, conn, pbm, d)
+}
+
+func validateCleanupMode(olderThan string, lifecycle bool) error {
+	if olderThan == "" && !lifecycle {
+		return errors.New("either --older-than or --lifecycle should be set")
+	}
+	if olderThan != "" && lifecycle {
+		return errors.New("cannot use --older-than and --lifecycle at the same command")
+	}
+
+	return nil
+}
+
+func doCleanupOlderThan(
+	ctx context.Context,
+	conn connect.Client,
+	pbm *sdk.Client,
+	d *cleanupOptions,
+) (fmt.Stringer, error) {
 	ts, err := parseOlderThan(d.olderThan)
 	if err != nil {
 		return nil, errors.Wrap(err, "parse --older-than")
@@ -327,6 +362,112 @@ func doCleanup(ctx context.Context, conn connect.Client, pbm *sdk.Client, d *cle
 		err = errWaitTimeout
 	}
 	return rv, err
+}
+
+func doLifecycleCleanup(
+	ctx context.Context,
+	conn connect.Client,
+	pbm *sdk.Client,
+	d *cleanupOptions,
+	out outFormat,
+) (fmt.Stringer, error) {
+	if err := d.profile.Validate(ctx, conn); err != nil {
+		return nil, err
+	}
+	if !d.dryRun {
+		if err := checkForAnotherOperation(ctx, pbm); err != nil {
+			return nil, err
+		}
+	}
+
+	lifecycleAt := bson.Timestamp{T: uint32(time.Now().UTC().Unix())}
+	evaluationTime := time.Unix(int64(lifecycleAt.T), 0).UTC()
+	report, err := lifecycle.EvaluateProfile(
+		ctx, conn, d.profile.Value(), d.dryRun, evaluationTime,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	isJSON := out == outJSON || out == outJSONpretty
+	if !isJSON {
+		fmt.Println(report.String())
+	}
+	if d.dryRun || !report.ConfigUsed.Enabled {
+		if isJSON {
+			return lifecycleResult{Report: report}, nil
+		}
+		return nil, nil
+	}
+	if len(report.BackupsPurged) == 0 {
+		if isJSON {
+			return lifecycleResult{Report: report, Msg: "No backups to purge."}, nil
+		}
+		return outMsg{"No backups to purge."}, nil
+	}
+
+	if question := lifecycleConfirmationQuestion(report, d.yes); question != "" {
+		if err := askConfirmation(question); err != nil {
+			return lifecycleCancellation(report, err, isJSON)
+		}
+	}
+
+	cid, err := pbm.RunLifecycleCleanup(ctx, lifecycleAt, d.profile.Value())
+	if err != nil {
+		return nil, errors.Wrap(err, "send command")
+	}
+	if !d.wait {
+		msg := "Processing by agents. Please check status later"
+		if isJSON {
+			return lifecycleResult{Report: report, Msg: msg}, nil
+		}
+		return outMsg{msg}, nil
+	}
+
+	if d.waitTime > time.Second {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d.waitTime)
+		defer cancel()
+	}
+
+	rv, err := waitForDelete(ctx, conn, pbm, cid)
+	if errors.Is(err, context.DeadlineExceeded) {
+		err = errWaitTimeout
+	}
+	return rv, err
+}
+
+func lifecycleConfirmationQuestion(report *lifecycle.Report, yes bool) string {
+	if yes {
+		return ""
+	}
+
+	minKeep := 1
+	if report.ConfigUsed.MinKeep != nil {
+		minKeep = *report.ConfigUsed.MinKeep
+	}
+	if len(report.BackupsKept) < minKeep {
+		return fmt.Sprintf(
+			"This rotation would leave %d backup(s), below minKeep %d. Force deletion?",
+			len(report.BackupsKept), minKeep,
+		)
+	}
+
+	return "Are you sure you want to permanently delete the purged backups?"
+}
+
+func lifecycleCancellation(
+	report *lifecycle.Report,
+	err error,
+	isJSON bool,
+) (fmt.Stringer, error) {
+	if !errors.Is(err, errUserCanceled) {
+		return nil, err
+	}
+	if isJSON {
+		return lifecycleResult{Report: report, Msg: err.Error(), Aborted: true}, nil
+	}
+	return outMsg{err.Error()}, nil
 }
 
 func parseOlderThan(s string) (bson.Timestamp, error) {

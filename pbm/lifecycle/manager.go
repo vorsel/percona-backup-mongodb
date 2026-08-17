@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"slices"
@@ -9,7 +10,9 @@ import (
 
 	"github.com/percona/percona-backup-mongodb/pbm/backup"
 	"github.com/percona/percona-backup-mongodb/pbm/config"
+	"github.com/percona/percona-backup-mongodb/pbm/connect"
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
+	"github.com/percona/percona-backup-mongodb/pbm/errors"
 )
 
 type Report struct {
@@ -19,6 +22,54 @@ type Report struct {
 	BackupsPurged []string             `json:"backupsPurged"`
 	KeepReasons   map[string][]string  `json:"keepReasons"`
 	BackupTypes   map[string]string    `json:"backupTypes"`
+}
+
+func filterBackupsByProfile(backups []backup.BackupMeta, profile string) []backup.BackupMeta {
+	filtered := make([]backup.BackupMeta, 0, len(backups))
+	for _, bcp := range backups {
+		if profile != "" && bcp.Store.Name != profile {
+			continue
+		}
+		if profile == "" && bcp.Store.IsProfile {
+			continue
+		}
+
+		filtered = append(filtered, bcp)
+	}
+
+	return filtered
+}
+
+// EvaluateProfile loads lifecycle configuration and backup metadata for one
+// profile, then evaluates the policy at the provided time.
+func EvaluateProfile(
+	ctx context.Context,
+	conn connect.Client,
+	profile string,
+	dryRun bool,
+	now time.Time,
+) (*Report, error) {
+	var cfg *config.Config
+	var err error
+	if profile == "" {
+		cfg, err = config.GetConfig(ctx, conn)
+		if err != nil {
+			return nil, errors.Wrap(err, "get config")
+		}
+	} else {
+		cfg, err = config.GetProfile(ctx, conn, profile)
+		if err != nil {
+			return nil, errors.Wrap(err, "get profile config")
+		}
+	}
+
+	backups, err := backup.BackupsList(ctx, conn, 0)
+	if err != nil {
+		return nil, errors.Wrap(err, "fetch backups")
+	}
+
+	backups = filterBackupsByProfile(backups, profile)
+	return Evaluate(*cfg.Lifecycle, backups, dryRun, now), nil
 }
 
 func (r *Report) String() string {
