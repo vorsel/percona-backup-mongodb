@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -120,145 +119,6 @@ func (app *pbmApp) validateEnum(fieldName, value string, valid []string) error {
 	return errors.New(fmt.Sprintf("invalid %s value: %q (must be one of %v)", fieldName, value, valid))
 }
 
-func (app *pbmApp) buildLifecycleCmd() *cobra.Command {
-	var dryRun *bool
-	var profile string
-
-	lifecycleCmd := &cobra.Command{
-		Use:   "lifecycle",
-		Short: "Manage backup retention and rotation lifecycle",
-		RunE: app.wrapRunE(func(cmd *cobra.Command, args []string) (fmt.Stringer, error) {
-
-			report, err := lifecycle.EvaluateProfile(
-				app.ctx, app.conn, profile, *dryRun, time.Now().UTC(),
-			)
-			if err != nil {
-				return nil, err
-			}
-			isJSON := app.pbmOutF == outJSON || app.pbmOutF == outJSONpretty
-
-			if !isJSON {
-				fmt.Println(report.String())
-			}
-
-			if *dryRun || !report.ConfigUsed.Enabled {
-				if isJSON {
-					return lifecycleResult{Report: report}, nil
-				}
-				return nil, nil
-			}
-
-			if len(report.BackupsPurged) == 0 {
-				if isJSON {
-					return lifecycleResult{Report: report, Msg: "No backups to purge.", Aborted: false}, nil
-				}
-				fmt.Println("No backups to purge.")
-				return nil, nil
-			}
-
-			minKeep := 1
-			if report.ConfigUsed.MinKeep != nil {
-				minKeep = *report.ConfigUsed.MinKeep
-			}
-
-			shouldPrompt := true
-			if report.ConfigUsed.Prompt != nil {
-				shouldPrompt = *report.ConfigUsed.Prompt
-			}
-
-			if isJSON {
-				shouldPrompt = false
-			}
-
-			if len(report.BackupsKept) < minKeep {
-				if !isJSON {
-					fmt.Printf("\nWARNING: This rotation would leave you with %d backup(s), which is below the safety threshold of %d (minKeep).\n", len(report.BackupsKept), minKeep)
-				}
-
-				if shouldPrompt {
-					fmt.Print("Do you want to FORCE the deletion anyway and bypass this safety threshold? [y/N]: ")
-					reader := bufio.NewReader(os.Stdin)
-					response, err := reader.ReadString('\n')
-					if err != nil {
-						return nil, errors.Wrap(err, "read prompt response")
-					}
-
-					response = strings.ToLower(strings.TrimSpace(response))
-					if response != "y" && response != "yes" {
-						msg := "Operation cancelled by user to protect backups."
-						if isJSON {
-							return lifecycleResult{Report: report, Msg: msg, Aborted: true}, nil
-						}
-						fmt.Println(msg)
-						return nil, nil
-					}
-				} else {
-					msg := "Automated run (prompt: false) detected. Purge aborted to protect your backups."
-					if isJSON {
-						return lifecycleResult{Report: report, Msg: msg, Aborted: true}, nil
-					}
-					fmt.Println(msg)
-					return nil, nil
-				}
-			} else if shouldPrompt {
-				fmt.Print("Are you sure you want to permanently delete the purged backups? [y/N]: ")
-				reader := bufio.NewReader(os.Stdin)
-				response, err := reader.ReadString('\n')
-				if err != nil {
-					return nil, errors.Wrap(err, "read prompt response")
-				}
-
-				response = strings.ToLower(strings.TrimSpace(response))
-				if response != "y" && response != "yes" {
-					msg := "Operation cancelled by user."
-					if isJSON {
-						return lifecycleResult{Report: report, Msg: msg, Aborted: true}, nil
-					}
-					fmt.Println(msg)
-					return nil, nil
-				}
-			}
-
-			if !isJSON {
-				fmt.Println("Starting deletion...")
-			}
-
-			for i := len(report.BackupsPurged) - 1; i >= 0; i-- {
-				name := report.BackupsPurged[i]
-
-				if app.ctx.Err() != nil {
-					return lifecycleResult{Report: report, Msg: "Operation cancelled by user.", Aborted: true}, nil
-				}
-
-				if !isJSON {
-					fmt.Printf("Purging backup %s...\n", name)
-				}
-
-				err := backup.DeleteBackup(app.ctx, app.conn, name, app.node)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to delete %s: %v\n", name, err)
-				}
-			}
-
-			msg := "Lifecycle rotation complete."
-			if isJSON {
-				return lifecycleResult{Report: report, Msg: msg, Aborted: false}, nil
-			}
-			fmt.Println(msg)
-			return nil, nil
-		}),
-	}
-
-	dryRun = lifecycleCmd.Flags().Bool("dry-run", false, "Report but do not delete")
-
-	// Register the profile flag
-	lifecycleCmd.Flags().StringVar(
-		&profile, "profile", "", "Config profile name to apply specific lifecycle rules",
-	)
-
-	return lifecycleCmd
-}
-
 func newPbmApp() *pbmApp {
 	app := &pbmApp{}
 	app.ctx, app.cancel = context.WithCancel(context.Background())
@@ -303,7 +163,6 @@ func newPbmApp() *pbmApp {
 	app.rootCmd.AddCommand(app.buildStatusCmd())
 	app.rootCmd.AddCommand(app.buildVersionCmd())
 	app.rootCmd.AddCommand(util.CompletionCommand())
-	app.rootCmd.AddCommand(app.buildLifecycleCmd())
 
 	return app
 }

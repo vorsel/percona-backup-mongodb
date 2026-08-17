@@ -74,7 +74,6 @@ type LifecycleConf struct {
 	Enabled     bool   `bson:"enabled" json:"enabled" yaml:"enabled"`
 	Strategy    string `bson:"strategy,omitempty" json:"strategy,omitempty" yaml:"strategy,omitempty"`
 	PurgeFailed bool   `bson:"purgeFailed" json:"purgeFailed" yaml:"purgeFailed"`
-	Prompt      *bool  `bson:"prompt,omitempty" json:"prompt,omitempty" yaml:"prompt,omitempty"`
 
 	MinKeep *int `bson:"minKeep,omitempty" json:"minKeep,omitempty" yaml:"minKeep,omitempty"`
 

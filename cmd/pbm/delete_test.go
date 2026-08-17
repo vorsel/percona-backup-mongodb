@@ -49,11 +49,9 @@ func TestValidateCleanupMode(t *testing.T) {
 }
 
 func TestLifecycleConfirmationQuestion(t *testing.T) {
-	prompt := false
 	minKeep := 2
 	report := &lifecycle.Report{
 		ConfigUsed: config.LifecycleConf{
-			Prompt:  &prompt,
 			MinKeep: &minKeep,
 		},
 		BackupsKept: []string{"backup-1", "backup-2"},
@@ -62,7 +60,6 @@ func TestLifecycleConfirmationQuestion(t *testing.T) {
 	assert.Equal(t,
 		"Are you sure you want to permanently delete the purged backups?",
 		lifecycleConfirmationQuestion(report, false),
-		"lifecycle.prompt must not suppress cleanup confirmation",
 	)
 	assert.Empty(t, lifecycleConfirmationQuestion(report, true), "--yes must suppress confirmation")
 
@@ -71,4 +68,17 @@ func TestLifecycleConfirmationQuestion(t *testing.T) {
 		"This rotation would leave 1 backup(s), below minKeep 2. Force deletion?",
 		lifecycleConfirmationQuestion(report, false),
 	)
+}
+
+func TestLifecycleCommandSurface(t *testing.T) {
+	app := newPbmApp()
+	for _, cmd := range app.rootCmd.Commands() {
+		assert.NotEqual(t, "lifecycle", cmd.Name(), "top-level lifecycle command must not be registered")
+	}
+
+	cleanup, _, err := app.rootCmd.Find([]string{"cleanup"})
+	assert.NoError(t, err)
+	if assert.NotNil(t, cleanup) {
+		assert.NotNil(t, cleanup.Flags().Lookup("lifecycle"))
+	}
 }
