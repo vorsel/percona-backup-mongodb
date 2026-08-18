@@ -463,11 +463,10 @@ func describeBackup(
 	}
 
 	var stg storage.Storage
-	if b.coll || bcp.Size == 0 {
+	if b.coll {
 		l := log.LogEventFromContext(ctx)
 
 		// to read backed up collection names
-		// or calculate size of files for legacy backups
 		stg, err = util.StorageFromConfig(&bcp.Store.StorageConf, node, l)
 		if err != nil {
 			return nil, errors.Wrap(err, "get storage")
