@@ -509,17 +509,6 @@ func describeBackup(
 		rv.Err = &bcp.Err
 	}
 
-	if bcp.Size == 0 {
-		switch bcp.Status {
-		case defs.StatusDone, defs.StatusCancelled, defs.StatusError:
-			rv.Size, err = getLegacySnapshotSize(bcp, stg)
-			if errors.Is(err, errMissedFile) && bcp.Status != defs.StatusDone {
-				// canceled/failed backup can be incomplete. ignore
-				return nil, errors.Wrap(err, "get snapshot size")
-			}
-		}
-	}
-
 	rv.Replsets = make([]bcpReplDesc, len(bcp.Replsets))
 	for i, r := range bcp.Replsets {
 		rv.Replsets[i] = bcpReplDesc{
