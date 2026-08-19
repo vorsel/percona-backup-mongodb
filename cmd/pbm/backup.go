@@ -463,16 +463,13 @@ func describeBackup(
 	}
 
 	var stg storage.Storage
-	if b.coll || bcp.Size == 0 {
-		l := log.LogEventFromContext(ctx)
-
+	if b.coll {
 		// to read backed up collection names
-		// or calculate size of files for legacy backups
-		stg, err = util.StorageFromConfig(&bcp.Store.StorageConf, node, l)
+		stg, err = util.StorageFromConfig(&bcp.Store.StorageConf, node, log.DiscardEvent)
 		if err != nil {
 			return nil, errors.Wrap(err, "get storage")
 		}
-		defer storage.Close(stg, l)
+		defer storage.Close(stg, log.DiscardEvent)
 
 		err = storage.HasReadAccess(ctx, stg)
 		if err != nil && !errors.Is(err, storage.ErrUninitialized) {
@@ -507,17 +504,6 @@ func describeBackup(
 	}
 	if bcp.Err != "" {
 		rv.Err = &bcp.Err
-	}
-
-	if bcp.Size == 0 {
-		switch bcp.Status {
-		case defs.StatusDone, defs.StatusCancelled, defs.StatusError:
-			rv.Size, err = getLegacySnapshotSize(bcp, stg)
-			if errors.Is(err, errMissedFile) && bcp.Status != defs.StatusDone {
-				// canceled/failed backup can be incomplete. ignore
-				return nil, errors.Wrap(err, "get snapshot size")
-			}
-		}
 	}
 
 	rv.Replsets = make([]bcpReplDesc, len(bcp.Replsets))
