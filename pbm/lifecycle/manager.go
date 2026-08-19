@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/mod/semver"
+
 	"github.com/percona/percona-backup-mongodb/pbm/backup"
 	"github.com/percona/percona-backup-mongodb/pbm/config"
 	"github.com/percona/percona-backup-mongodb/pbm/connect"
@@ -22,15 +24,45 @@ type Report struct {
 	BackupsPurged []string             `json:"backupsPurged"`
 	KeepReasons   map[string][]string  `json:"keepReasons"`
 	BackupTypes   map[string]string    `json:"backupTypes"`
+	// DeleteTargets contains entry points passed to the checked deletion path. An
+	// incremental chain contributes only its base while BackupsPurged lists every member.
+	DeleteTargets []string `json:"-"`
+}
+
+const (
+	incrementalChainReason        = "Incremental Chain Retained"
+	invalidIncrementalChainReason = "Invalid Incremental Chain"
+	incrementalStorageGuard       = "v2.6.0"
+)
+
+type incrementalChain struct {
+	members []backup.BackupMeta
+	valid   bool
+}
+
+func (r *Report) addKeepReason(name, reason string) {
+	for _, existing := range r.KeepReasons[name] {
+		if existing == reason {
+			return
+		}
+	}
+	r.KeepReasons[name] = append(r.KeepReasons[name], reason)
+}
+
+func (r *Report) countKeptSuccessfulBackups(backups []backup.BackupMeta) int {
+	count := 0
+	for _, bcp := range backups {
+		if bcp.Status == defs.StatusDone && len(r.KeepReasons[bcp.Name]) > 0 {
+			count++
+		}
+	}
+	return count
 }
 
 func filterBackupsByProfile(backups []backup.BackupMeta, profile string) []backup.BackupMeta {
 	filtered := make([]backup.BackupMeta, 0, len(backups))
 	for _, bcp := range backups {
-		if profile != "" && bcp.Store.Name != profile {
-			continue
-		}
-		if profile == "" && bcp.Store.IsProfile {
+		if bcp.Store.Name != profile {
 			continue
 		}
 
@@ -63,13 +95,166 @@ func EvaluateProfile(
 		}
 	}
 
-	backups, err := backup.BackupsList(ctx, conn, 0)
+	allBackups, err := backup.BackupsList(ctx, conn, 0)
 	if err != nil {
 		return nil, errors.Wrap(err, "fetch backups")
 	}
 
-	backups = filterBackupsByProfile(backups, profile)
-	return Evaluate(*cfg.Lifecycle, backups, dryRun, now), nil
+	selectedBackups := filterBackupsByProfile(allBackups, profile)
+	return evaluate(*cfg.Lifecycle, selectedBackups, allBackups, dryRun, now), nil
+}
+
+// buildIncrementalChains groups incremental metadata by its resolved base and
+// marks chains unsafe when they cross profile or successful-backup storage boundaries.
+func buildIncrementalChains(
+	allBackups []backup.BackupMeta,
+	selectedNames map[string]struct{},
+) []incrementalChain {
+	byName := make(map[string]backup.BackupMeta, len(allBackups))
+	for _, bcp := range allBackups {
+		if bcp.Type != defs.IncrementalBackup {
+			continue
+		}
+		byName[bcp.Name] = bcp
+	}
+
+	byBase := make(map[string][]backup.BackupMeta)
+	var bases []string
+	var invalid []incrementalChain
+	for _, bcp := range allBackups {
+		if bcp.Type != defs.IncrementalBackup {
+			continue
+		}
+
+		base, ok := findIncrementalBase(bcp, byName)
+		if !ok {
+			invalid = append(invalid, incrementalChain{members: []backup.BackupMeta{bcp}})
+			continue
+		}
+		if _, ok := byBase[base.Name]; !ok {
+			bases = append(bases, base.Name)
+		}
+		byBase[base.Name] = append(byBase[base.Name], bcp)
+	}
+
+	chains := make([]incrementalChain, 0, len(bases)+len(invalid))
+	for _, baseName := range bases {
+		base := byName[baseName]
+		chain := incrementalChain{members: byBase[baseName], valid: true}
+		for _, member := range chain.members {
+			if _, ok := selectedNames[member.Name]; !ok {
+				chain.valid = false
+				break
+			}
+			if mustShareIncrementalStorage(member) &&
+				!member.Store.IsSameStorage(&base.Store.StorageConf) {
+				chain.valid = false
+				break
+			}
+		}
+		chains = append(chains, chain)
+	}
+
+	return append(chains, invalid...)
+}
+
+// mustShareIncrementalStorage identifies metadata that can own backup data.
+// Since v2.6, failed attempts reject a different storage before uploading files.
+func mustShareIncrementalStorage(bcp backup.BackupMeta) bool {
+	if bcp.Status == defs.StatusDone {
+		return true
+	}
+
+	v := bcp.PBMVersion
+	if !strings.HasPrefix(v, "v") {
+		v = "v" + v
+	}
+	return !semver.IsValid(v) || semver.Compare(v, incrementalStorageGuard) < 0
+}
+
+// findIncrementalBase follows source links to the base. Unresolvable links fail
+// closed so lifecycle cleanup does not emit a non-base deletion target.
+func findIncrementalBase(
+	bcp backup.BackupMeta,
+	byName map[string]backup.BackupMeta,
+) (backup.BackupMeta, bool) {
+	seen := make(map[string]struct{})
+	for bcp.SrcBackup != "" {
+		if _, ok := seen[bcp.Name]; ok {
+			return backup.BackupMeta{}, false
+		}
+		seen[bcp.Name] = struct{}{}
+
+		parent, ok := byName[bcp.SrcBackup]
+		if !ok {
+			return backup.BackupMeta{}, false
+		}
+		bcp = parent
+	}
+
+	return bcp, bcp.Name != ""
+}
+
+// applyIncrementalChainRules expands keep decisions to complete incremental
+// chains and protects chains that cannot be deleted within the selected profile.
+func (r *Report) applyIncrementalChainRules(selectedBackups, allBackups []backup.BackupMeta) {
+	selectedNames := make(map[string]struct{}, len(selectedBackups))
+	for _, bcp := range selectedBackups {
+		selectedNames[bcp.Name] = struct{}{}
+	}
+
+	chains := buildIncrementalChains(allBackups, selectedNames)
+	for _, chain := range chains {
+		if !chain.valid {
+			for _, member := range chain.members {
+				if _, ok := selectedNames[member.Name]; ok && !member.Status.IsRunning() {
+					r.addKeepReason(member.Name, invalidIncrementalChainReason)
+				}
+			}
+			continue
+		}
+
+		retain := false
+		for _, member := range chain.members {
+			if len(r.KeepReasons[member.Name]) > 0 || member.Status.IsRunning() {
+				retain = true
+				break
+			}
+		}
+		if !retain {
+			continue
+		}
+
+		for _, member := range chain.members {
+			if _, ok := selectedNames[member.Name]; !ok || member.Status.IsRunning() {
+				continue
+			}
+			if len(r.KeepReasons[member.Name]) == 0 {
+				r.addKeepReason(member.Name, incrementalChainReason)
+			}
+		}
+	}
+}
+
+// buildBackupLists materializes the final report after all keep decisions have
+// been made. Incremental deletion targets contain only chain bases.
+func (r *Report) buildBackupLists(backups []backup.BackupMeta) {
+	for _, bcp := range backups {
+		if bcp.Status.IsRunning() {
+			continue
+		}
+
+		r.BackupTypes[bcp.Name] = string(bcp.Type)
+		if len(r.KeepReasons[bcp.Name]) > 0 {
+			r.BackupsKept = append(r.BackupsKept, bcp.Name)
+			continue
+		}
+
+		r.BackupsPurged = append(r.BackupsPurged, bcp.Name)
+		if bcp.Type != defs.IncrementalBackup || bcp.SrcBackup == "" {
+			r.DeleteTargets = append(r.DeleteTargets, bcp.Name)
+		}
+	}
 }
 
 func (r *Report) String() string {
@@ -92,7 +277,13 @@ func (r *Report) String() string {
 	}
 
 	res := fmt.Sprintf("Lifecycle Report (Dry Run: %v)\n", r.DryRun)
-	res += fmt.Sprintf("Enabled: %v | Strategy: %s | Purge Failed: %v | Min Keep: %d\n", r.ConfigUsed.Enabled, strings.ToUpper(strategy), r.ConfigUsed.PurgeFailed, minKeep)
+	res += fmt.Sprintf(
+		"Enabled: %v | Strategy: %s | Purge Failed: %v | Min Keep: %d\n",
+		r.ConfigUsed.Enabled,
+		strings.ToUpper(strategy),
+		r.ConfigUsed.PurgeFailed,
+		minKeep,
+	)
 	res += fmt.Sprintf("Daily: %d | Weekly: %d [%s] | Monthly: %d [%s]\n\n",
 		r.ConfigUsed.DailyRetention,
 		r.ConfigUsed.WeeklyRetention, weeklyStr,
@@ -116,6 +307,16 @@ func (r *Report) String() string {
 // Evaluate analyzes backups according to the lifecycle configuration and
 // returns a report describing which backups should be kept or purged.
 func Evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, dryRun bool, now time.Time) *Report {
+	return evaluate(cfg, backups, backups, dryRun, now)
+}
+
+func evaluate(
+	cfg config.LifecycleConf,
+	selectedBackups []backup.BackupMeta,
+	allBackups []backup.BackupMeta,
+	dryRun bool,
+	now time.Time,
+) *Report {
 	report := &Report{
 		DryRun:      dryRun,
 		ConfigUsed:  cfg,
@@ -124,28 +325,17 @@ func Evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, dryRun bool
 	}
 
 	if !cfg.Enabled {
-		for _, bcp := range backups {
+		for _, bcp := range selectedBackups {
 			if bcp.Status.IsRunning() {
 				continue
 			}
-			report.BackupTypes[bcp.Name] = string(bcp.Type)
-			report.BackupsKept = append(report.BackupsKept, bcp.Name)
-			report.KeepReasons[bcp.Name] = []string{"Lifecycle Disabled"}
+			report.addKeepReason(bcp.Name, "Lifecycle Disabled")
 		}
+		report.buildBackupLists(selectedBackups)
 		return report
 	}
 
 	isCalendar := strings.ToLower(cfg.Strategy) == "calendar"
-	keepMap := make(map[string][]string)
-
-	addReason := func(name, reason string) {
-		for _, r := range keepMap[name] {
-			if r == reason {
-				return
-			}
-		}
-		keepMap[name] = append(keepMap[name], reason)
-	}
 
 	dailyCutoff := now.AddDate(0, 0, -cfg.DailyRetention)
 	weeklyCutoff := now.AddDate(0, 0, -(cfg.WeeklyRetention * 7))
@@ -155,9 +345,8 @@ func Evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, dryRun bool
 	monthlyCandidates := make(map[string][]backup.BackupMeta)
 
 	// 1. Bucketing phase
-	for _, bcp := range backups {
+	for _, bcp := range selectedBackups {
 		if bcp.Status.IsRunning() {
-			addReason(bcp.Name, "In-Progress")
 			continue
 		}
 
@@ -166,17 +355,17 @@ func Evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, dryRun bool
 
 		if bcp.Status == defs.StatusError || bcp.Status == defs.StatusCancelled {
 			if !cfg.PurgeFailed {
-				addReason(bcp.Name, "Failed (Protected)")
+				report.addKeepReason(bcp.Name, "Failed (Protected)")
 			} else {
 				if cfg.DailyRetention > 0 && !bcpTime.Before(dailyCutoff) {
-					addReason(bcp.Name, "Failed (Inside Daily Window)")
+					report.addKeepReason(bcp.Name, "Failed (Inside Daily Window)")
 				}
 			}
 			continue
 		}
 
 		if cfg.DailyRetention > 0 && !bcpTime.Before(dailyCutoff) {
-			addReason(bcp.Name, "Daily")
+			report.addKeepReason(bcp.Name, "Daily")
 			continue
 		}
 
@@ -213,42 +402,30 @@ func Evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, dryRun bool
 	for _, candidates := range weeklyCandidates {
 		bestBcp := findBestCandidate(candidates, cfg.WeeklyDay, false, isCalendar)
 		if bestBcp != nil {
-			addReason(bestBcp.Name, "Weekly")
+			report.addKeepReason(bestBcp.Name, "Weekly")
 		}
 	}
 
 	for _, candidates := range monthlyCandidates {
 		bestBcp := findBestCandidate(candidates, cfg.MonthlyDay, true, isCalendar)
 		if bestBcp != nil {
-			addReason(bestBcp.Name, "Monthly")
+			report.addKeepReason(bestBcp.Name, "Monthly")
 		}
 	}
 
-	// 3. Finalize Lists
-	for _, bcp := range backups {
-		if bcp.Status.IsRunning() {
-			continue
-		}
-
-		report.BackupTypes[bcp.Name] = string(bcp.Type)
-
-		if len(keepMap[bcp.Name]) > 0 {
-			report.BackupsKept = append(report.BackupsKept, bcp.Name)
-			report.KeepReasons[bcp.Name] = keepMap[bcp.Name]
-		} else {
-			report.BackupsPurged = append(report.BackupsPurged, bcp.Name)
-		}
-	}
+	// Account for mandatory chain retention before enforcing minKeep.
+	report.applyIncrementalChainRules(selectedBackups, allBackups)
 
 	minKeep := 1
 	if cfg.MinKeep != nil {
 		minKeep = *cfg.MinKeep
 	}
 
-	if minKeep > 0 && len(report.BackupsKept) < minKeep {
+	keptCount := report.countKeptSuccessfulBackups(selectedBackups)
+	if minKeep > 0 && keptCount < minKeep {
 		var rescue []backup.BackupMeta
-		for _, bcp := range backups {
-			if bcp.Status == defs.StatusDone && len(keepMap[bcp.Name]) == 0 {
+		for _, bcp := range selectedBackups {
+			if bcp.Status == defs.StatusDone && len(report.KeepReasons[bcp.Name]) == 0 {
 				rescue = append(rescue, bcp)
 			}
 		}
@@ -265,24 +442,28 @@ func Evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, dryRun bool
 		})
 
 		for _, bcp := range rescue {
-			if len(report.BackupsKept) >= minKeep {
+			if keptCount >= minKeep {
 				break
 			}
-			report.BackupsKept = append(report.BackupsKept, bcp.Name)
-			report.KeepReasons[bcp.Name] = []string{"Min Keep"}
-
-			// Remove from Purged list safely
-			report.BackupsPurged = slices.DeleteFunc(report.BackupsPurged, func(name string) bool {
-				return name == bcp.Name
-			})
+			report.addKeepReason(bcp.Name, "Min Keep")
+			keptCount++
 		}
 	}
+
+	// A backup rescued by minKeep may require the rest of its chain.
+	report.applyIncrementalChainRules(selectedBackups, allBackups)
+	report.buildBackupLists(selectedBackups)
 
 	return report
 }
 
 // findBestCandidate selects the optimal backup from a bucket.
-func findBestCandidate(candidates []backup.BackupMeta, targetDayInt int, isMonthly bool, isCalendar bool) *backup.BackupMeta {
+func findBestCandidate(
+	candidates []backup.BackupMeta,
+	targetDayInt int,
+	isMonthly bool,
+	isCalendar bool,
+) *backup.BackupMeta {
 	if len(candidates) == 0 {
 		return nil
 	}

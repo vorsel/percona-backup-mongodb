@@ -339,15 +339,15 @@ func (a *Agent) cleanupLifecycle(
 		l.Info("lifecycle is disabled %s", util.LogProfileArg(d.Profile))
 		return
 	}
-	if len(report.BackupsPurged) == 0 {
+	if len(report.DeleteTargets) == 0 {
 		l.Info("no backups to purge %s", util.LogProfileArg(d.Profile))
 		return
 	}
 
 	l.Info("deleting backups according to lifecycle policy evaluated at %v %s",
 		lifecycleAt, util.LogProfileArg(d.Profile))
-	for i := len(report.BackupsPurged) - 1; i >= 0; i-- {
-		name := report.BackupsPurged[i]
+	for i := len(report.DeleteTargets) - 1; i >= 0; i-- {
+		name := report.DeleteTargets[i]
 		if err := backup.DeleteBackup(ctx, a.leadConn, name, node); err != nil {
 			l.Error("delete backup %q: %v", name, err)
 		}
