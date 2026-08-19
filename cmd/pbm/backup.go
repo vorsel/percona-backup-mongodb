@@ -464,14 +464,12 @@ func describeBackup(
 
 	var stg storage.Storage
 	if b.coll {
-		l := log.LogEventFromContext(ctx)
-
 		// to read backed up collection names
-		stg, err = util.StorageFromConfig(&bcp.Store.StorageConf, node, l)
+		stg, err = util.StorageFromConfig(&bcp.Store.StorageConf, node, log.DiscardEvent)
 		if err != nil {
 			return nil, errors.Wrap(err, "get storage")
 		}
-		defer storage.Close(stg, l)
+		defer storage.Close(stg, log.DiscardEvent)
 
 		err = storage.HasReadAccess(ctx, stg)
 		if err != nil && !errors.Is(err, storage.ErrUninitialized) {
