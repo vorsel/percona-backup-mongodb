@@ -85,8 +85,13 @@ func ChangeBackupStateOPID(conn connect.Client, opid string, s defs.Status, msg 
 }
 
 func ChangeBackupState(conn connect.Client, bcpName string, s defs.Status, msg string) error {
-	return changeBackupState(context.TODO(),
-		conn, bson.D{{"name", bcpName}}, time.Now().UTC().Unix(), s, msg)
+	return changeBackupState(
+		context.TODO(),
+		conn, bson.D{{"name", bcpName}},
+		time.Now().UTC().Unix(),
+		s,
+		msg,
+	)
 }
 
 func ChangeBackupStateWithUnixTime(
@@ -94,10 +99,17 @@ func ChangeBackupStateWithUnixTime(
 	conn connect.Client,
 	bcpName string,
 	s defs.Status,
-	unix int64,
+	ts int64,
 	msg string,
 ) error {
-	return changeBackupState(ctx, conn, bson.D{{"name", bcpName}}, time.Now().UTC().Unix(), s, msg)
+	return changeBackupState(
+		ctx,
+		conn,
+		bson.D{{"name", bcpName}},
+		ts,
+		s,
+		msg,
+	)
 }
 
 func changeBackupState(

@@ -392,7 +392,6 @@ func (b *Backup) Run(ctx context.Context, bcp *ctrl.BackupCmd, opid ctrl.OPID, l
 			Timestamp: unix,
 			Status:    defs.StatusDone,
 		})
-		bcpm.FinishTime = unix
 
 		err = writeMeta(stg, bcpm)
 		if err != nil {
