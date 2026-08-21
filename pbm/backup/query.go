@@ -163,6 +163,19 @@ func SetSrcBackup(ctx context.Context, conn connect.Client, bcpName, srcName str
 	return err
 }
 
+// SetFinishTime sets the time when the backup has ended.
+func SetFinishTime(ctx context.Context, conn connect.Client, bcpName string, sec int64) error {
+	_, err := conn.BcpCollection().UpdateOne(
+		ctx,
+		bson.D{{"name", bcpName}},
+		bson.D{
+			{"$set", bson.M{"finish_time": sec}},
+		},
+	)
+
+	return err
+}
+
 func SetFirstWrite(ctx context.Context, conn connect.Client, bcpName string, first bson.Timestamp) error {
 	_, err := conn.BcpCollection().UpdateOne(
 		ctx,

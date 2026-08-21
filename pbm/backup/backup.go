@@ -121,6 +121,7 @@ func (b *Backup) Init(
 	bcp *ctrl.BackupCmd,
 	opid ctrl.OPID,
 	balancer topo.BalancerMode,
+	startTime int64,
 ) error {
 	ts, err := topo.GetClusterTime(ctx, b.leadConn)
 	if err != nil {
@@ -151,6 +152,7 @@ func (b *Backup) Init(
 		Nomination:     []BackupRsNomination{},
 		BalancerStatus: balancer,
 		Hb:             ts,
+		StartTime:      startTime,
 	}
 
 	fcv, err := version.GetFCV(ctx, b.nodeConn)
@@ -390,6 +392,7 @@ func (b *Backup) Run(ctx context.Context, bcp *ctrl.BackupCmd, opid ctrl.OPID, l
 			Timestamp: unix,
 			Status:    defs.StatusDone,
 		})
+		bcpm.FinishTime = unix
 
 		err = writeMeta(stg, bcpm)
 		if err != nil {
