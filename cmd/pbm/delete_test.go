@@ -1,9 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"testing"
 
-	"github.com/percona/percona-backup-mongodb/pbm/config"
 	"github.com/percona/percona-backup-mongodb/pbm/lifecycle"
 	"github.com/stretchr/testify/assert"
 )
@@ -48,26 +48,35 @@ func TestValidateCleanupMode(t *testing.T) {
 	}
 }
 
-func TestLifecycleConfirmationQuestion(t *testing.T) {
-	minKeep := 2
+func TestLifecycleResultUsesReportAbortState(t *testing.T) {
 	report := &lifecycle.Report{
-		ConfigUsed: config.LifecycleConf{
-			MinKeep: &minKeep,
-		},
-		BackupsKept: []string{"backup-1", "backup-2"},
+		Aborted:     true,
+		AbortReason: "below minKeep",
 	}
+	result := lifecycleResult{Report: report, Msg: "Lifecycle cleanup aborted."}
 
-	assert.Equal(t,
-		"Are you sure you want to permanently delete the purged backups?",
-		lifecycleConfirmationQuestion(report, false),
-	)
-	assert.Empty(t, lifecycleConfirmationQuestion(report, true), "--yes must suppress confirmation")
+	assert.Same(t, report, result.Report)
+	assert.Equal(t, "Lifecycle cleanup aborted.", result.String())
+	assert.Equal(t, report.String(), (lifecycleResult{Report: report}).String())
+	assert.Empty(t, (lifecycleResult{}).String())
 
-	report.BackupsKept = report.BackupsKept[:1]
-	assert.Equal(t,
-		"This rotation would leave 1 backup(s), below minKeep 2. Force deletion?",
-		lifecycleConfirmationQuestion(report, false),
-	)
+	b, err := json.Marshal(result)
+	assert.NoError(t, err)
+	var got struct {
+		Report struct {
+			Aborted     bool   `json:"aborted"`
+			AbortReason string `json:"abortReason"`
+		} `json:"report"`
+		Msg string `json:"msg"`
+	}
+	assert.NoError(t, json.Unmarshal(b, &got))
+	assert.True(t, got.Report.Aborted)
+	assert.Equal(t, "below minKeep", got.Report.AbortReason)
+	assert.Equal(t, "Lifecycle cleanup aborted.", got.Msg)
+
+	var raw map[string]json.RawMessage
+	assert.NoError(t, json.Unmarshal(b, &raw))
+	assert.NotContains(t, raw, "aborted", "abort state should have one canonical location")
 }
 
 func TestLifecycleCommandSurface(t *testing.T) {

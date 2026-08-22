@@ -389,26 +389,29 @@ func doLifecycleCleanup(
 		return nil, err
 	}
 
-	isJSON := out == outJSON || out == outJSONpretty
-	if !isJSON {
+	result := lifecycleResult{Report: report}
+	if d.dryRun || !report.ConfigUsed.Enabled {
+		return result, nil
+	}
+	if out == outText {
 		fmt.Println(report.String())
 	}
-	if d.dryRun || !report.ConfigUsed.Enabled {
-		if isJSON {
-			return lifecycleResult{Report: report}, nil
-		}
-		return nil, nil
+	if report.Aborted {
+		result.Msg = "Lifecycle cleanup aborted."
+		return result, nil
 	}
 	if len(report.BackupsPurged) == 0 {
-		if isJSON {
-			return lifecycleResult{Report: report, Msg: "No backups to purge."}, nil
-		}
-		return outMsg{"No backups to purge."}, nil
+		result.Msg = "No backups to purge."
+		return result, nil
 	}
 
-	if question := lifecycleConfirmationQuestion(report, d.yes); question != "" {
-		if err := askConfirmation(question); err != nil {
-			return lifecycleCancellation(report, err, isJSON)
+	if !d.yes {
+		if err := askConfirmation("Are you sure you want to permanently delete the purged backups?"); err != nil {
+			if !errors.Is(err, errUserCanceled) {
+				return nil, err
+			}
+			result.Msg = err.Error()
+			return result, nil
 		}
 	}
 
@@ -417,11 +420,8 @@ func doLifecycleCleanup(
 		return nil, errors.Wrap(err, "send command")
 	}
 	if !d.wait {
-		msg := "Processing by agents. Please check status later"
-		if isJSON {
-			return lifecycleResult{Report: report, Msg: msg}, nil
-		}
-		return outMsg{msg}, nil
+		result.Msg = "Processing by agents. Please check status later"
+		return result, nil
 	}
 
 	if d.waitTime > time.Second {
@@ -435,39 +435,6 @@ func doLifecycleCleanup(
 		err = errWaitTimeout
 	}
 	return rv, err
-}
-
-func lifecycleConfirmationQuestion(report *lifecycle.Report, yes bool) string {
-	if yes {
-		return ""
-	}
-
-	minKeep := 1
-	if report.ConfigUsed.MinKeep != nil {
-		minKeep = *report.ConfigUsed.MinKeep
-	}
-	if len(report.BackupsKept) < minKeep {
-		return fmt.Sprintf(
-			"This rotation would leave %d backup(s), below minKeep %d. Force deletion?",
-			len(report.BackupsKept), minKeep,
-		)
-	}
-
-	return "Are you sure you want to permanently delete the purged backups?"
-}
-
-func lifecycleCancellation(
-	report *lifecycle.Report,
-	err error,
-	isJSON bool,
-) (fmt.Stringer, error) {
-	if !errors.Is(err, errUserCanceled) {
-		return nil, err
-	}
-	if isJSON {
-		return lifecycleResult{Report: report, Msg: err.Error(), Aborted: true}, nil
-	}
-	return outMsg{err.Error()}, nil
 }
 
 func parseOlderThan(s string) (bson.Timestamp, error) {

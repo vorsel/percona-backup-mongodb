@@ -74,15 +74,18 @@ type pbmApp struct {
 }
 
 type lifecycleResult struct {
-	Report  *lifecycle.Report `json:"report"`
-	Msg     string            `json:"msg"`
-	Aborted bool              `json:"aborted"`
+	Report *lifecycle.Report `json:"report"`
+	Msg    string            `json:"msg"`
 }
 
 func (r lifecycleResult) String() string {
-	// In text mode, the report is progressively printed to stdout.
-	// This stringer just returns the final exit message.
-	return r.Msg
+	if r.Msg != "" {
+		return r.Msg
+	}
+	if r.Report != nil {
+		return r.Report.String()
+	}
+	return ""
 }
 
 func main() {

@@ -138,6 +138,7 @@ func TestEvaluate(t *testing.T) {
 	standardDate := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)     // A normal Thursday
 	leapYearDate := time.Date(2024, time.February, 29, 12, 0, 0, 0, time.UTC)  // Leap Day
 	endOfYearDate := time.Date(2025, time.December, 31, 12, 0, 0, 0, time.UTC) // Dec 31st
+	minKeepDisabled := 0
 
 	tests := []struct {
 		name           string
@@ -244,10 +245,11 @@ func TestEvaluate(t *testing.T) {
 
 		// --- STATE HANDLING SCENARIOS ---
 		{
-			name: "In-Progress Backups are ALWAYS protected (and MinKeep rescues the last safe base)",
+			name: "In-Progress Backups are protected without changing policy decisions",
 			cfg: config.LifecycleConf{
 				Enabled:        true,
 				DailyRetention: 1,
+				MinKeep:        &minKeepDisabled,
 			},
 			mockNow: standardDate,
 			backups: []backup.BackupMeta{
@@ -256,9 +258,8 @@ func TestEvaluate(t *testing.T) {
 			},
 			dryRun: false,
 			// bcp-running is implicitly protected (hidden from purge).
-			// bcp-done-old is expired, but rescued because MinKeep defaults to 1 and the running backup doesn't count yet!
-			expectedKept:   []string{"bcp-done-old"},
-			expectedPurged: []string{},
+			expectedKept:   []string{},
+			expectedPurged: []string{"bcp-done-old"},
 		},
 		{
 			name: "Failed Backups - PurgeFailed is TRUE",
@@ -266,6 +267,7 @@ func TestEvaluate(t *testing.T) {
 				Enabled:        true,
 				PurgeFailed:    true,
 				DailyRetention: 7, // Protect for 7 days
+				MinKeep:        &minKeepDisabled,
 			},
 			mockNow: standardDate,
 			backups: []backup.BackupMeta{
@@ -305,6 +307,9 @@ func TestEvaluate(t *testing.T) {
 
 			if report.DryRun != tt.dryRun {
 				t.Errorf("Report.DryRun = %v, want %v", report.DryRun, tt.dryRun)
+			}
+			if report.Aborted {
+				t.Errorf("unexpected aborted plan: %s", report.AbortReason)
 			}
 
 			sort.Strings(report.BackupsKept)
@@ -438,17 +443,17 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(candidates.names) == 0 {
+		if len(candidates.anchors) == 0 {
 			t.Fatal("PITR base candidate not found")
 		}
-		if !reflect.DeepEqual(candidates.names, []string{"latest"}) ||
+		if !reflect.DeepEqual(candidates.anchors, []string{"latest"}) ||
 			candidates.previousRestoreTime.T != 100 || candidates.restoreTime.T != 300 {
 			t.Fatalf("candidates = %+v, want latest with range 100-300", candidates)
 		}
 		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 150, End: 400}}) {
 			t.Fatal("candidate should be required for PITR")
 		}
-		report.protectPITRAnchors(candidates.names, backups, backups)
+		report.protectPITRAnchors(candidates.anchors, backups, backups)
 
 		if !reflect.DeepEqual(report.BackupsKept, []string{"survivor", "latest"}) {
 			t.Fatalf("BackupsKept = %v, want survivor and latest", report.BackupsKept)
@@ -475,7 +480,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(candidates.names) != 0 {
+		if len(candidates.anchors) != 0 {
 			t.Fatal("PITR base candidate found despite newer surviving snapshot")
 		}
 		if !reflect.DeepEqual(report.BackupsPurged, []string{"candidate"}) {
@@ -499,17 +504,17 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(candidates.names) == 0 {
+		if len(candidates.anchors) == 0 {
 			t.Fatal("PITR base candidate not found")
 		}
-		if !reflect.DeepEqual(candidates.names, []string{"inc-2"}) ||
+		if !reflect.DeepEqual(candidates.anchors, []string{"inc-2"}) ||
 			candidates.previousRestoreTime.T != 100 || candidates.restoreTime.T != 400 {
 			t.Fatalf("candidates = %+v, want inc-2 with projected range 100-400", candidates)
 		}
 		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 350, End: 500}}) {
 			t.Fatal("incremental chain should be required for PITR")
 		}
-		report.protectPITRAnchors(candidates.names, backups, backups)
+		report.protectPITRAnchors(candidates.anchors, backups, backups)
 
 		wantKept := []string{"survivor", "inc-2", "inc-1", "base"}
 		if !reflect.DeepEqual(report.BackupsKept, wantKept) {
@@ -542,14 +547,14 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(candidates.names) == 0 ||
+		if len(candidates.anchors) == 0 ||
 			candidates.previousRestoreTime.T != 50 || candidates.restoreTime.T != 300 {
 			t.Fatalf("candidates = %+v, want projected range 50-300", candidates)
 		}
 		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 100, End: 300}}) {
 			t.Fatal("purged chain members cannot replace the surviving PITR base")
 		}
-		report.protectPITRAnchors(candidates.names, backups, backups)
+		report.protectPITRAnchors(candidates.anchors, backups, backups)
 
 		if !reflect.DeepEqual(report.BackupsPurged, []string{"standalone"}) {
 			t.Fatalf("BackupsPurged = %v, want standalone", report.BackupsPurged)
@@ -572,7 +577,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(candidates.names) == 0 ||
+		if len(candidates.anchors) == 0 ||
 			candidates.previousRestoreTime.T != 100 || candidates.restoreTime.T != 300 {
 			t.Fatalf("candidates = %+v, want projected range 100-300", candidates)
 		}
@@ -593,11 +598,11 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(candidates.names) == 0 {
+		if len(candidates.anchors) == 0 {
 			t.Fatal("PITR base candidates not found")
 		}
-		if !reflect.DeepEqual(candidates.names, []string{"alpha", "zeta"}) {
-			t.Fatalf("names = %v, want deterministic ties", candidates.names)
+		if !reflect.DeepEqual(candidates.anchors, []string{"alpha", "zeta"}) {
+			t.Fatalf("anchors = %v, want deterministic ties", candidates.anchors)
 		}
 		if candidates.previousRestoreTime.T != 100 || candidates.restoreTime.T != 300 {
 			t.Fatalf("candidates = %+v, want range 100-300", candidates)
@@ -605,7 +610,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 150, End: 400}}) {
 			t.Fatal("tied candidates should be required for PITR")
 		}
-		report.protectPITRAnchors(candidates.names, backups, backups)
+		report.protectPITRAnchors(candidates.anchors, backups, backups)
 
 		if len(report.BackupsPurged) != 0 || len(report.DeleteTargets) != 0 {
 			t.Fatalf("tied PITR bases remained purgeable: %+v", report)
@@ -635,7 +640,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(candidates.names) == 0 || !reflect.DeepEqual(candidates.names, []string{"candidate"}) {
+		if len(candidates.anchors) == 0 || !reflect.DeepEqual(candidates.anchors, []string{"candidate"}) {
 			t.Fatalf("candidates = %+v, want candidate despite newer ineligible backups", candidates)
 		}
 	})
@@ -650,7 +655,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(candidates.names) == 0 || !candidates.previousRestoreTime.IsZero() {
+		if len(candidates.anchors) == 0 || !candidates.previousRestoreTime.IsZero() {
 			t.Fatalf("candidates = %+v, want no previous survivor", candidates)
 		}
 		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 150, End: 400}}) {
@@ -676,7 +681,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(candidates.names) == 0 {
+		if len(candidates.anchors) == 0 {
 			t.Fatal("PITR base candidate not found")
 		}
 		timelines := []oplog.Timeline{{Start: 150, End: 200}, {Start: 250, End: 300}}
@@ -766,79 +771,280 @@ func TestEvaluateProtectedIncrementRetainsChain(t *testing.T) {
 	})
 }
 
-func TestEvaluateMinKeepRetainsCompleteIncrementalChain(t *testing.T) {
-	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
-	report := Evaluate(config.LifecycleConf{Enabled: true}, []backup.BackupMeta{
-		mockIncrementalBcp("inc-1", "base", 10, now, defs.StatusDone),
-		mockIncrementalBcp("base", "", 30, now, defs.StatusDone),
-	}, false, now)
-
-	if !reflect.DeepEqual(report.BackupsKept, []string{"inc-1", "base"}) {
-		t.Fatalf("BackupsKept = %v, want complete chain", report.BackupsKept)
-	}
-	if !reflect.DeepEqual(report.KeepReasons["inc-1"], []string{"Min Keep"}) {
-		t.Errorf("inc-1 reasons = %v, want Min Keep", report.KeepReasons["inc-1"])
-	}
-	if !reflect.DeepEqual(report.KeepReasons["base"], []string{incrementalChainReason}) {
-		t.Errorf("base reasons = %v, want %q", report.KeepReasons["base"], incrementalChainReason)
-	}
-	if len(report.DeleteTargets) != 0 {
-		t.Fatalf("DeleteTargets = %v, want none", report.DeleteTargets)
-	}
-
-}
-
-func TestEvaluateMinKeepCountsOnlySuccessfulBackups(t *testing.T) {
+func TestEvaluateMinKeepHardAbort(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	minKeep := 2
+	cfg := config.LifecycleConf{
+		Enabled:        true,
+		MinKeep:        &minKeep,
+		DailyRetention: 1,
+	}
+	backups := []backup.BackupMeta{
+		mockTypedBcp("kept", 0, now, defs.StatusDone, defs.LogicalBackup),
+		mockTypedBcp("expired", 10, now, defs.StatusDone, defs.LogicalBackup),
+	}
+
+	for _, dryRun := range []bool{false, true} {
+		report := Evaluate(cfg, backups, dryRun, now)
+		if !report.Aborted {
+			t.Fatalf("dryRun=%v: expected minKeep abort", dryRun)
+		}
+		wantReason := "successful restore point count 1 is below minKeep 2"
+		if report.AbortReason != wantReason {
+			t.Fatalf("dryRun=%v: AbortReason = %q, want %q", dryRun, report.AbortReason, wantReason)
+		}
+		if !reflect.DeepEqual(report.BackupsKept, []string{"kept"}) ||
+			!reflect.DeepEqual(report.BackupsPurged, []string{"expired"}) {
+			t.Fatalf("dryRun=%v: unexpected proposed plan: %+v", dryRun, report)
+		}
+		if len(report.DeleteTargets) != 0 {
+			t.Fatalf("dryRun=%v: aborted plan has targets %v", dryRun, report.DeleteTargets)
+		}
+		if strings.Contains(strings.Join(report.KeepReasons["expired"], ","), "Min Keep") {
+			t.Fatalf("dryRun=%v: minKeep must not rescue expired backups", dryRun)
+		}
+	}
+
+	text := Evaluate(cfg, backups, true, now).String()
+	if !strings.Contains(text, "Status: ABORTED") ||
+		!strings.Contains(text, "Proposed backups to PURGE (not executed)") {
+		t.Fatalf("aborted report is not explicit:\n%s", text)
+	}
+}
+
+func TestEvaluateMinKeepThresholdAndDisable(t *testing.T) {
+	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
+	backups := []backup.BackupMeta{
+		mockTypedBcp("kept-1", 0, now, defs.StatusDone, defs.LogicalBackup),
+		mockTypedBcp("kept-2", 1, now, defs.StatusDone, defs.LogicalBackup),
+		mockTypedBcp("expired", 10, now, defs.StatusDone, defs.LogicalBackup),
+	}
+
+	minKeep := 2
+	report := Evaluate(config.LifecycleConf{
+		Enabled:        true,
+		DailyRetention: 2,
+		MinKeep:        &minKeep,
+	}, backups, false, now)
+	if report.Aborted || !reflect.DeepEqual(report.DeleteTargets, []string{"expired"}) {
+		t.Fatalf("exact minKeep threshold should remain executable: %+v", report)
+	}
+
+	minKeep = 1
+	report = Evaluate(config.LifecycleConf{
+		Enabled:        true,
+		DailyRetention: 2,
+		MinKeep:        &minKeep,
+	}, backups, false, now)
+	if report.Aborted || !reflect.DeepEqual(report.DeleteTargets, []string{"expired"}) {
+		t.Fatalf("plan above minKeep should remain executable: %+v", report)
+	}
+
+	minKeep = 0
+	report = Evaluate(config.LifecycleConf{
+		Enabled: true,
+		MinKeep: &minKeep,
+	}, backups, false, now)
+	if report.Aborted || len(report.DeleteTargets) != len(backups) {
+		t.Fatalf("minKeep zero should disable the circuit breaker: %+v", report)
+	}
+}
+
+func TestEvaluateMinKeepGuardRequiresDeletionTargets(t *testing.T) {
+	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
+	minKeep := 1
+
 	report := Evaluate(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
 	}, []backup.BackupMeta{
-		mockTypedBcp("failed", 1, now, defs.StatusError, defs.LogicalBackup),
-		mockTypedBcp("canceled", 2, now, defs.StatusCancelled, defs.LogicalBackup),
-		mockTypedBcp("success-new", 10, now, defs.StatusDone, defs.LogicalBackup),
-		mockTypedBcp("success-old", 20, now, defs.StatusDone, defs.LogicalBackup),
+		mockTypedBcp("failed", 10, now, defs.StatusError, defs.LogicalBackup),
 	}, false, now)
+	if report.Aborted {
+		t.Fatalf("plan without deletion targets should not be aborted: %+v", report)
+	}
 
-	wantKept := []string{"failed", "canceled", "success-new", "success-old"}
-	if !reflect.DeepEqual(report.BackupsKept, wantKept) {
-		t.Fatalf("BackupsKept = %v, want %v", report.BackupsKept, wantKept)
+	report = Evaluate(config.LifecycleConf{
+		Enabled:     true,
+		PurgeFailed: true,
+		MinKeep:     &minKeep,
+	}, []backup.BackupMeta{
+		mockTypedBcp("failed", 10, now, defs.StatusError, defs.LogicalBackup),
+	}, false, now)
+	if !report.Aborted {
+		t.Fatal("deletion should be blocked while the profile is below minKeep")
 	}
-	for _, name := range []string{"success-new", "success-old"} {
-		if !reflect.DeepEqual(report.KeepReasons[name], []string{"Min Keep"}) {
-			t.Errorf("%s reasons = %v, want Min Keep", name, report.KeepReasons[name])
-		}
+	if !reflect.DeepEqual(report.BackupsPurged, []string{"failed"}) {
+		t.Fatalf("BackupsPurged = %v, want proposed failed purge", report.BackupsPurged)
 	}
-	if len(report.BackupsPurged) != 0 || len(report.DeleteTargets) != 0 {
-		t.Fatalf("minKeep should preserve all successful backups: %+v", report)
+	if len(report.DeleteTargets) != 0 {
+		t.Fatalf("aborted plan has targets %v", report.DeleteTargets)
 	}
 }
 
-func TestEvaluateMinKeepCountsMandatoryChainRetention(t *testing.T) {
+func TestEvaluateMinKeepCountsOnlyCompleteSuccessfulRestorePoints(t *testing.T) {
+	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
+	minKeep := 2
+	selective := mockTypedBcp("selective", 0, now, defs.StatusDone, defs.LogicalBackup)
+	selective.Namespaces = []string{"db.collection"}
+	report := Evaluate(config.LifecycleConf{
+		Enabled:        true,
+		DailyRetention: 1,
+		MinKeep:        &minKeep,
+	}, []backup.BackupMeta{
+		mockTypedBcp("success", 0, now, defs.StatusDone, defs.LogicalBackup),
+		selective,
+		mockTypedBcp("failed", 10, now, defs.StatusError, defs.LogicalBackup),
+		mockTypedBcp("canceled", 10, now, defs.StatusCancelled, defs.LogicalBackup),
+		mockTypedBcp("running", 0, now, defs.StatusRunning, defs.LogicalBackup),
+		mockTypedBcp("expired", 10, now, defs.StatusDone, defs.LogicalBackup),
+	}, false, now)
+
+	if !report.Aborted {
+		t.Fatal("failed, canceled, running, and selective backups must not satisfy minKeep")
+	}
+	if !reflect.DeepEqual(report.BackupsPurged, []string{"expired"}) {
+		t.Fatalf("BackupsPurged = %v, want expired", report.BackupsPurged)
+	}
+	if len(report.DeleteTargets) != 0 {
+		t.Fatalf("aborted plan has targets %v", report.DeleteTargets)
+	}
+}
+
+func TestEvaluateMinKeepCountsSuccessfulIncrementalRestorePoints(t *testing.T) {
+	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
+	minKeep := 2
+	report := Evaluate(config.LifecycleConf{
+		Enabled:        true,
+		DailyRetention: 1,
+		MinKeep:        &minKeep,
+	}, []backup.BackupMeta{
+		mockIncrementalBcp("inc-1", "base", 0, now, defs.StatusDone),
+		mockIncrementalBcp("base", "", 30, now, defs.StatusDone),
+		mockTypedBcp("standalone", 10, now, defs.StatusDone, defs.LogicalBackup),
+	}, false, now)
+
+	if report.Aborted {
+		t.Fatalf("two retained incremental restore points should satisfy minKeep: %+v", report)
+	}
+	if !reflect.DeepEqual(report.BackupsKept, []string{"inc-1", "base"}) {
+		t.Fatalf("BackupsKept = %v, want complete incremental chain", report.BackupsKept)
+	}
+	if !reflect.DeepEqual(report.DeleteTargets, []string{"standalone"}) {
+		t.Fatalf("DeleteTargets = %v, want standalone", report.DeleteTargets)
+	}
+}
+
+func TestEvaluateMinKeepExcludesInvalidIncrementalChains(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	minKeep := 1
 	report := Evaluate(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
 	}, []backup.BackupMeta{
-		mockTypedBcp("standalone", 5, now, defs.StatusDone, defs.LogicalBackup),
-		mockIncrementalBcp("failed-attempt", "base", 10, now, defs.StatusError),
-		mockIncrementalBcp("base", "", 30, now, defs.StatusDone),
+		mockIncrementalBcp("orphan", "missing", 1, now, defs.StatusDone),
+		mockTypedBcp("valid-standalone", 10, now, defs.StatusDone, defs.LogicalBackup),
 	}, false, now)
 
-	wantKept := []string{"failed-attempt", "base"}
-	if !reflect.DeepEqual(report.BackupsKept, wantKept) {
-		t.Fatalf("BackupsKept = %v, want %v", report.BackupsKept, wantKept)
+	if !report.Aborted {
+		t.Fatal("invalid incremental metadata must not satisfy minKeep")
 	}
-	if !reflect.DeepEqual(report.BackupsPurged, []string{"standalone"}) {
-		t.Fatalf("BackupsPurged = %v, want standalone", report.BackupsPurged)
+	if !reflect.DeepEqual(report.BackupsKept, []string{"orphan"}) {
+		t.Fatalf("BackupsKept = %v, want retained orphan", report.BackupsKept)
+	}
+	if !reflect.DeepEqual(report.BackupsPurged, []string{"valid-standalone"}) {
+		t.Fatalf("BackupsPurged = %v, want proposed valid-standalone purge", report.BackupsPurged)
+	}
+	if len(report.DeleteTargets) != 0 {
+		t.Fatalf("aborted plan has targets %v", report.DeleteTargets)
+	}
+}
+
+func TestEvaluateMinKeepCountsSplitChainBase(t *testing.T) {
+	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
+	minKeep := 2
+	cfg := config.LifecycleConf{
+		Enabled: true,
+		MinKeep: &minKeep,
+	}
+	allBackups := []backup.BackupMeta{
+		mockIncrementalBcp("archive-inc", "inc-1", 1, now, defs.StatusDone),
+		mockIncrementalBcp("inc-1", "base", 5, now, defs.StatusDone),
+		mockIncrementalBcp("base", "", 10, now, defs.StatusDone),
+		mockTypedBcp("standalone", 20, now, defs.StatusDone, defs.LogicalBackup),
+	}
+	allBackups[0].Store.Name = "archive"
+	allBackups[0].Store.IsProfile = true
+	selectedBackups := filterBackupsByProfile(allBackups, "")
+
+	report := evaluateRetentionPolicy(cfg, selectedBackups, allBackups, false, now)
+	report.applyMinKeepGuard(selectedBackups)
+
+	if report.Aborted {
+		t.Fatalf("complete prefix of split chain should satisfy minKeep: %+v", report)
+	}
+	if !reflect.DeepEqual(report.BackupsKept, []string{"inc-1", "base"}) {
+		t.Fatalf("BackupsKept = %v, want independently restorable chain prefix", report.BackupsKept)
 	}
 	if !reflect.DeepEqual(report.DeleteTargets, []string{"standalone"}) {
 		t.Fatalf("DeleteTargets = %v, want standalone", report.DeleteTargets)
 	}
-	if !reflect.DeepEqual(report.KeepReasons["base"], []string{incrementalChainReason}) {
-		t.Errorf("base reasons = %v, want %q", report.KeepReasons["base"], incrementalChainReason)
+}
+
+func TestMinKeepCountsPITRProtectedRestorePoint(t *testing.T) {
+	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
+	minKeep := 2
+	cfg := config.LifecycleConf{
+		Enabled:        true,
+		DailyRetention: 1,
+		MinKeep:        &minKeep,
+	}
+	backups := []backup.BackupMeta{
+		mockTypedBcp("policy-kept", 0, now, defs.StatusDone, defs.LogicalBackup),
+		mockTypedBcp("pitr-base", 10, now, defs.StatusDone, defs.LogicalBackup),
+		mockTypedBcp("expired", 20, now, defs.StatusDone, defs.LogicalBackup),
+	}
+
+	report := evaluateRetentionPolicy(cfg, backups, backups, false, now)
+	report.protectPITRAnchors([]string{"pitr-base"}, backups, backups)
+	report.applyMinKeepGuard(backups)
+
+	if report.Aborted {
+		t.Fatalf("PITR-protected restore point should satisfy minKeep: %+v", report)
+	}
+	if !reflect.DeepEqual(report.BackupsKept, []string{"policy-kept", "pitr-base"}) {
+		t.Fatalf("BackupsKept = %v, want policy-kept and pitr-base", report.BackupsKept)
+	}
+	if !reflect.DeepEqual(report.DeleteTargets, []string{"expired"}) {
+		t.Fatalf("DeleteTargets = %v, want expired", report.DeleteTargets)
+	}
+}
+
+func TestMinKeepIsScopedToSelectedProfile(t *testing.T) {
+	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
+	minKeep := 2
+	cfg := config.LifecycleConf{
+		Enabled:        true,
+		DailyRetention: 1,
+		MinKeep:        &minKeep,
+	}
+	allBackups := []backup.BackupMeta{
+		mockTypedBcp("main-kept", 0, now, defs.StatusDone, defs.LogicalBackup),
+		mockTypedBcp("main-expired", 10, now, defs.StatusDone, defs.LogicalBackup),
+		mockTypedBcp("profile-kept", 0, now, defs.StatusDone, defs.LogicalBackup),
+	}
+	allBackups[2].Store.Name = "archive"
+	allBackups[2].Store.IsProfile = true
+	selectedBackups := filterBackupsByProfile(allBackups, "")
+
+	report := evaluateRetentionPolicy(cfg, selectedBackups, allBackups, false, now)
+	report.applyMinKeepGuard(selectedBackups)
+
+	if !report.Aborted {
+		t.Fatal("a backup in another profile must not satisfy main minKeep")
+	}
+	if !reflect.DeepEqual(report.BackupsPurged, []string{"main-expired"}) {
+		t.Fatalf("BackupsPurged = %v, want main-expired", report.BackupsPurged)
 	}
 }
 
@@ -908,7 +1114,7 @@ func TestEvaluateProtectsChainSplitAcrossProfiles(t *testing.T) {
 	allBackups[0].Store.Name = "archive"
 	allBackups[0].Store.IsProfile = true
 	mainBackups := filterBackupsByProfile(allBackups, "")
-	report := evaluate(config.LifecycleConf{
+	report := evaluateRetentionPolicy(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
 	}, mainBackups, allBackups, false, now)
@@ -924,7 +1130,7 @@ func TestEvaluateProtectsChainSplitAcrossProfiles(t *testing.T) {
 	}
 
 	archiveBackups := filterBackupsByProfile(allBackups, "archive")
-	archiveReport := evaluate(config.LifecycleConf{
+	archiveReport := evaluateRetentionPolicy(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
 	}, archiveBackups, allBackups, false, now)

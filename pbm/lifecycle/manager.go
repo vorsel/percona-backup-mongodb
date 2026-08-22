@@ -22,6 +22,8 @@ import (
 type Report struct {
 	DryRun        bool                 `json:"dryRun"`
 	ConfigUsed    config.LifecycleConf `json:"configUsed"`
+	Aborted       bool                 `json:"aborted"`
+	AbortReason   string               `json:"abortReason,omitempty"`
 	BackupsKept   []string             `json:"backupsKept"`
 	BackupsPurged []string             `json:"backupsPurged"`
 	KeepReasons   map[string][]string  `json:"keepReasons"`
@@ -38,12 +40,12 @@ const (
 )
 
 type incrementalChain struct {
-	members []backup.BackupMeta
-	valid   bool
+	members   []backup.BackupMeta
+	deletable bool
 }
 
 type pitrBaseCandidates struct {
-	names               []string
+	anchors             []string
 	previousRestoreTime bson.Timestamp
 	restoreTime         bson.Timestamp
 }
@@ -57,14 +59,57 @@ func (r *Report) addKeepReason(name, reason string) {
 	r.KeepReasons[name] = append(r.KeepReasons[name], reason)
 }
 
-func (r *Report) countKeptSuccessfulBackups(backups []backup.BackupMeta) int {
+func (r *Report) countKeptSuccessfulRestorePoints(backups []backup.BackupMeta) int {
+	increments := make(map[string]backup.BackupMeta)
+	for _, bcp := range backups {
+		if bcp.Type == defs.IncrementalBackup {
+			increments[bcp.Name] = bcp
+		}
+	}
+
 	count := 0
 	for _, bcp := range backups {
-		if bcp.Status == defs.StatusDone && len(r.KeepReasons[bcp.Name]) > 0 {
+		reasons := r.KeepReasons[bcp.Name]
+		if bcp.Status == defs.StatusDone &&
+			!util.IsSelective(bcp.Namespaces) &&
+			len(reasons) > 0 &&
+			(bcp.Type != defs.IncrementalBackup || isCompleteIncrementalRestorePoint(bcp, increments)) {
 			count++
 		}
 	}
 	return count
+}
+
+// isCompleteIncrementalRestorePoint verifies that a candidate and all of its
+// selected-profile ancestors form a completed path on the base storage.
+func isCompleteIncrementalRestorePoint(
+	bcp backup.BackupMeta,
+	byName map[string]backup.BackupMeta,
+) bool {
+	path := []backup.BackupMeta{bcp}
+	seen := make(map[string]struct{})
+	for bcp.SrcBackup != "" {
+		if _, ok := seen[bcp.Name]; ok {
+			return false
+		}
+		seen[bcp.Name] = struct{}{}
+
+		parent, ok := byName[bcp.SrcBackup]
+		if !ok {
+			return false
+		}
+		path = append(path, parent)
+		bcp = parent
+	}
+
+	base := bcp
+	for _, member := range path {
+		if member.Status != defs.StatusDone ||
+			!member.Store.IsSameStorage(&base.Store.StorageConf) {
+			return false
+		}
+	}
+	return true
 }
 
 func filterBackupsByProfile(backups []backup.BackupMeta, profile string) []backup.BackupMeta {
@@ -109,7 +154,7 @@ func EvaluateProfile(
 	}
 
 	selectedBackups := filterBackupsByProfile(allBackups, profile)
-	report := evaluate(*cfg.Lifecycle, selectedBackups, allBackups, dryRun, now)
+	report := evaluateRetentionPolicy(*cfg.Lifecycle, selectedBackups, allBackups, dryRun, now)
 
 	pitrEnabled, oplogOnly := cfg.PITR.Enabled, cfg.PITR.OplogOnly
 	if profile != "" {
@@ -133,6 +178,7 @@ func EvaluateProfile(
 		}
 	}
 
+	report.applyMinKeepGuard(selectedBackups)
 	report.sortDeleteTargets(selectedBackups)
 	return report, nil
 }
@@ -173,15 +219,15 @@ func buildIncrementalChains(
 	chains := make([]incrementalChain, 0, len(bases)+len(invalid))
 	for _, baseName := range bases {
 		base := byName[baseName]
-		chain := incrementalChain{members: byBase[baseName], valid: true}
+		chain := incrementalChain{members: byBase[baseName], deletable: true}
 		for _, member := range chain.members {
 			if _, ok := selectedNames[member.Name]; !ok {
-				chain.valid = false
+				chain.deletable = false
 				break
 			}
 			if member.Status == defs.StatusDone &&
 				!member.Store.IsSameStorage(&base.Store.StorageConf) {
-				chain.valid = false
+				chain.deletable = false
 				break
 			}
 		}
@@ -224,7 +270,7 @@ func (r *Report) applyIncrementalChainRules(selectedBackups, allBackups []backup
 
 	chains := buildIncrementalChains(allBackups, selectedNames)
 	for _, chain := range chains {
-		if !chain.valid {
+		if !chain.deletable {
 			for _, member := range chain.members {
 				if _, ok := selectedNames[member.Name]; ok && !member.Status.IsRunning() {
 					r.addKeepReason(member.Name, invalidIncrementalChainReason)
@@ -332,7 +378,7 @@ func (r *Report) applyPITRProtection(
 	selectedBackups, allBackups []backup.BackupMeta,
 ) error {
 	candidates, err := r.findPITRBaseCandidates(selectedBackups)
-	if err != nil || len(candidates.names) == 0 {
+	if err != nil || len(candidates.anchors) == 0 {
 		return err
 	}
 
@@ -349,7 +395,7 @@ func (r *Report) applyPITRProtection(
 		return nil
 	}
 
-	r.protectPITRAnchors(candidates.names, selectedBackups, allBackups)
+	r.protectPITRAnchors(candidates.anchors, selectedBackups, allBackups)
 	return nil
 }
 
@@ -445,7 +491,7 @@ func (r *Report) findPITRBaseCandidates(backups []backup.BackupMeta) (pitrBaseCa
 	slices.Sort(anchorNames)
 
 	return pitrBaseCandidates{
-		names:               anchorNames,
+		anchors:             anchorNames,
 		previousRestoreTime: previousSnapshot,
 		restoreTime:         latestWrite,
 	}, nil
@@ -500,8 +546,8 @@ func (r *Report) sortDeleteTargets(backups []backup.BackupMeta) {
 	})
 }
 
-// buildBackupLists materializes the final report after all keep decisions have
-// been made. Incremental deletion targets contain only chain bases.
+// buildBackupLists rebuilds report projections from the current keep decisions.
+// Incremental deletion targets contain only chain bases.
 func (r *Report) buildBackupLists(backups []backup.BackupMeta) {
 	r.BackupsKept = nil
 	r.BackupsPurged = nil
@@ -523,6 +569,35 @@ func (r *Report) buildBackupLists(backups []backup.BackupMeta) {
 			r.DeleteTargets = append(r.DeleteTargets, bcp.Name)
 		}
 	}
+}
+
+// applyMinKeepGuard blocks execution when the retained restore-point count is
+// below minKeep. Proposed purge entries remain visible in the report.
+func (r *Report) applyMinKeepGuard(backups []backup.BackupMeta) {
+	if !r.ConfigUsed.Enabled || len(r.DeleteTargets) == 0 {
+		return
+	}
+
+	minKeep := 1
+	if r.ConfigUsed.MinKeep != nil {
+		minKeep = *r.ConfigUsed.MinKeep
+	}
+	if minKeep <= 0 {
+		return
+	}
+
+	kept := r.countKeptSuccessfulRestorePoints(backups)
+	if kept >= minKeep {
+		return
+	}
+
+	r.Aborted = true
+	r.AbortReason = fmt.Sprintf(
+		"successful restore point count %d is below minKeep %d",
+		kept,
+		minKeep,
+	)
+	r.DeleteTargets = nil
 }
 
 func (r *Report) String() string {
@@ -556,6 +631,9 @@ func (r *Report) String() string {
 		r.ConfigUsed.DailyRetention,
 		r.ConfigUsed.WeeklyRetention, weeklyStr,
 		r.ConfigUsed.MonthlyRetention, monthlyStr)
+	if r.Aborted {
+		res += fmt.Sprintf("Status: ABORTED | Reason: %s\n\n", r.AbortReason)
+	}
 
 	res += fmt.Sprintf("Backups to KEEP (%d):\n", len(r.BackupsKept))
 	for _, b := range r.BackupsKept {
@@ -564,7 +642,11 @@ func (r *Report) String() string {
 		res += fmt.Sprintf("  - %s <%s> [%s]\n", b, bType, reasons)
 	}
 
-	res += fmt.Sprintf("\nBackups to PURGE (%d):\n", len(r.BackupsPurged))
+	purgeHeading := "Backups to PURGE"
+	if r.Aborted {
+		purgeHeading = "Proposed backups to PURGE (not executed)"
+	}
+	res += fmt.Sprintf("\n%s (%d):\n", purgeHeading, len(r.BackupsPurged))
 	for _, b := range r.BackupsPurged {
 		bType := r.BackupTypes[b] // Fetch the type
 		res += fmt.Sprintf("  - %s <%s>\n", b, bType)
@@ -575,10 +657,12 @@ func (r *Report) String() string {
 // Evaluate analyzes backups according to the lifecycle configuration and
 // returns a report describing which backups should be kept or purged.
 func Evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, dryRun bool, now time.Time) *Report {
-	return evaluate(cfg, backups, backups, dryRun, now)
+	report := evaluateRetentionPolicy(cfg, backups, backups, dryRun, now)
+	report.applyMinKeepGuard(backups)
+	return report
 }
 
-func evaluate(
+func evaluateRetentionPolicy(
 	cfg config.LifecycleConf,
 	selectedBackups []backup.BackupMeta,
 	allBackups []backup.BackupMeta,
@@ -681,44 +765,7 @@ func evaluate(
 		}
 	}
 
-	// Account for mandatory chain retention before enforcing minKeep.
-	report.applyIncrementalChainRules(selectedBackups, allBackups)
-
-	minKeep := 1
-	if cfg.MinKeep != nil {
-		minKeep = *cfg.MinKeep
-	}
-
-	keptCount := report.countKeptSuccessfulBackups(selectedBackups)
-	if minKeep > 0 && keptCount < minKeep {
-		var rescue []backup.BackupMeta
-		for _, bcp := range selectedBackups {
-			if bcp.Status == defs.StatusDone && len(report.KeepReasons[bcp.Name]) == 0 {
-				rescue = append(rescue, bcp)
-			}
-		}
-
-		// Sort newest first to rescue the most recent ones
-		slices.SortFunc(rescue, func(a, b backup.BackupMeta) int {
-			if a.StartTS > b.StartTS {
-				return -1
-			}
-			if a.StartTS < b.StartTS {
-				return 1
-			}
-			return 0
-		})
-
-		for _, bcp := range rescue {
-			if keptCount >= minKeep {
-				break
-			}
-			report.addKeepReason(bcp.Name, "Min Keep")
-			keptCount++
-		}
-	}
-
-	// A backup rescued by minKeep may require the rest of its chain.
+	// Apply mandatory chain retention before materializing policy projections.
 	report.applyIncrementalChainRules(selectedBackups, allBackups)
 	report.buildBackupLists(selectedBackups)
 

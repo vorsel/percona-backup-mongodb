@@ -339,6 +339,10 @@ func (a *Agent) cleanupLifecycle(
 		l.Info("lifecycle is disabled %s", util.LogProfileArg(d.Profile))
 		return
 	}
+	if report.Aborted {
+		l.Warning("lifecycle cleanup aborted: %s %s", report.AbortReason, util.LogProfileArg(d.Profile))
+		return
+	}
 	if len(report.DeleteTargets) == 0 {
 		l.Info("no backups to purge %s", util.LogProfileArg(d.Profile))
 		return
