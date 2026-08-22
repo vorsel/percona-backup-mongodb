@@ -8,9 +8,12 @@ import (
 	"testing"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
+
 	"github.com/percona/percona-backup-mongodb/pbm/backup"
 	"github.com/percona/percona-backup-mongodb/pbm/config"
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
+	"github.com/percona/percona-backup-mongodb/pbm/oplog"
 	"github.com/percona/percona-backup-mongodb/pbm/storage"
 	storagefs "github.com/percona/percona-backup-mongodb/pbm/storage/fs"
 )
@@ -55,6 +58,11 @@ func mockIncrementalBcp(
 	return bcp
 }
 
+func withLastWrite(bcp backup.BackupMeta, ts uint32) backup.BackupMeta {
+	bcp.LastWriteTS = bson.Timestamp{T: ts}
+	return bcp
+}
+
 func TestFilterBackupsByProfile(t *testing.T) {
 	backups := []backup.BackupMeta{
 		{Name: "main"},
@@ -88,6 +96,38 @@ func TestFilterBackupsByProfile(t *testing.T) {
 
 			if !reflect.DeepEqual(gotNames, tt.want) {
 				t.Errorf("filterBackupsByProfile() = %v, want %v", gotNames, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsMainPITRBaseSnapshot(t *testing.T) {
+	base := backup.BackupMeta{Type: defs.LogicalBackup, Status: defs.StatusDone}
+	profile := base
+	profile.Store.IsProfile = true
+	failed := base
+	failed.Status = defs.StatusError
+	external := base
+	external.Type = defs.ExternalBackup
+	selective := base
+	selective.Namespaces = []string{"db.collection"}
+
+	tests := []struct {
+		name string
+		bcp  backup.BackupMeta
+		want bool
+	}{
+		{name: "main", bcp: base, want: true},
+		{name: "profile", bcp: profile},
+		{name: "failed", bcp: failed},
+		{name: "external", bcp: external},
+		{name: "selective", bcp: selective},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isMainPITRBaseSnapshot(tt.bcp); got != tt.want {
+				t.Fatalf("isMainPITRBaseSnapshot() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -377,6 +417,305 @@ func TestEvaluatePurgesIncrementalChainThroughRoot(t *testing.T) {
 	}
 }
 
+func TestPITRBaseCandidates(t *testing.T) {
+	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
+	minKeep := 0
+	cfg := config.LifecycleConf{
+		Enabled:        true,
+		DailyRetention: 1,
+		MinKeep:        &minKeep,
+	}
+
+	t.Run("multiple purge candidates", func(t *testing.T) {
+		backups := []backup.BackupMeta{
+			withLastWrite(mockTypedBcp("survivor", 0, now, defs.StatusDone, defs.LogicalBackup), 100),
+			withLastWrite(mockTypedBcp("latest", 10, now, defs.StatusDone, defs.LogicalBackup), 300),
+			withLastWrite(mockTypedBcp("older", 20, now, defs.StatusDone, defs.LogicalBackup), 200),
+		}
+		report := Evaluate(cfg, backups, true, now)
+
+		candidates, err := report.findPITRBaseCandidates(backups)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates.names) == 0 {
+			t.Fatal("PITR base candidate not found")
+		}
+		if !reflect.DeepEqual(candidates.names, []string{"latest"}) ||
+			candidates.previousRestoreTime.T != 100 || candidates.restoreTime.T != 300 {
+			t.Fatalf("candidates = %+v, want latest with range 100-300", candidates)
+		}
+		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 150, End: 400}}) {
+			t.Fatal("candidate should be required for PITR")
+		}
+		report.protectPITRAnchors(candidates.names, backups, backups)
+
+		if !reflect.DeepEqual(report.BackupsKept, []string{"survivor", "latest"}) {
+			t.Fatalf("BackupsKept = %v, want survivor and latest", report.BackupsKept)
+		}
+		if !reflect.DeepEqual(report.BackupsPurged, []string{"older"}) {
+			t.Fatalf("BackupsPurged = %v, want older", report.BackupsPurged)
+		}
+		if !reflect.DeepEqual(report.DeleteTargets, []string{"older"}) {
+			t.Fatalf("DeleteTargets = %v, want older", report.DeleteTargets)
+		}
+		if !reflect.DeepEqual(report.KeepReasons["latest"], []string{pitrBaseSnapshotReason}) {
+			t.Errorf("latest reasons = %v, want %q", report.KeepReasons["latest"], pitrBaseSnapshotReason)
+		}
+	})
+
+	t.Run("newer survivor", func(t *testing.T) {
+		backups := []backup.BackupMeta{
+			withLastWrite(mockTypedBcp("survivor", 0, now, defs.StatusDone, defs.LogicalBackup), 400),
+			withLastWrite(mockTypedBcp("candidate", 10, now, defs.StatusDone, defs.LogicalBackup), 300),
+		}
+		report := Evaluate(cfg, backups, true, now)
+
+		candidates, err := report.findPITRBaseCandidates(backups)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates.names) != 0 {
+			t.Fatal("PITR base candidate found despite newer surviving snapshot")
+		}
+		if !reflect.DeepEqual(report.BackupsPurged, []string{"candidate"}) {
+			t.Fatalf("BackupsPurged = %v, want candidate", report.BackupsPurged)
+		}
+		if !reflect.DeepEqual(report.DeleteTargets, []string{"candidate"}) {
+			t.Fatalf("DeleteTargets = %v, want candidate", report.DeleteTargets)
+		}
+	})
+
+	t.Run("multi-increment chain", func(t *testing.T) {
+		backups := []backup.BackupMeta{
+			withLastWrite(mockTypedBcp("survivor", 0, now, defs.StatusDone, defs.LogicalBackup), 100),
+			withLastWrite(mockIncrementalBcp("inc-2", "inc-1", 10, now, defs.StatusDone), 400),
+			withLastWrite(mockIncrementalBcp("inc-1", "base", 20, now, defs.StatusDone), 300),
+			withLastWrite(mockIncrementalBcp("base", "", 30, now, defs.StatusDone), 200),
+		}
+		report := Evaluate(cfg, backups, true, now)
+
+		candidates, err := report.findPITRBaseCandidates(backups)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates.names) == 0 {
+			t.Fatal("PITR base candidate not found")
+		}
+		if !reflect.DeepEqual(candidates.names, []string{"inc-2"}) ||
+			candidates.previousRestoreTime.T != 100 || candidates.restoreTime.T != 400 {
+			t.Fatalf("candidates = %+v, want inc-2 with projected range 100-400", candidates)
+		}
+		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 350, End: 500}}) {
+			t.Fatal("incremental chain should be required for PITR")
+		}
+		report.protectPITRAnchors(candidates.names, backups, backups)
+
+		wantKept := []string{"survivor", "inc-2", "inc-1", "base"}
+		if !reflect.DeepEqual(report.BackupsKept, wantKept) {
+			t.Fatalf("BackupsKept = %v, want %v", report.BackupsKept, wantKept)
+		}
+		if len(report.BackupsPurged) != 0 || len(report.DeleteTargets) != 0 {
+			t.Fatalf("PITR-protected chain remained purgeable: %+v", report)
+		}
+		if !reflect.DeepEqual(report.KeepReasons["inc-2"], []string{pitrBaseSnapshotReason}) {
+			t.Errorf("inc-2 reasons = %v, want %q", report.KeepReasons["inc-2"], pitrBaseSnapshotReason)
+		}
+		for _, name := range []string{"base", "inc-1"} {
+			if !reflect.DeepEqual(report.KeepReasons[name], []string{incrementalChainReason}) {
+				t.Errorf("%s reasons = %v, want %q", name, report.KeepReasons[name], incrementalChainReason)
+			}
+		}
+	})
+
+	t.Run("incremental candidate uses projected survivor", func(t *testing.T) {
+		backups := []backup.BackupMeta{
+			withLastWrite(mockTypedBcp("survivor", 0, now, defs.StatusDone, defs.LogicalBackup), 50),
+			withLastWrite(mockIncrementalBcp("inc-2", "inc-1", 10, now, defs.StatusDone), 300),
+			withLastWrite(mockTypedBcp("standalone", 15, now, defs.StatusDone, defs.LogicalBackup), 250),
+			withLastWrite(mockIncrementalBcp("inc-1", "base", 20, now, defs.StatusDone), 150),
+			withLastWrite(mockIncrementalBcp("base", "", 30, now, defs.StatusDone), 100),
+		}
+		report := Evaluate(cfg, backups, true, now)
+
+		candidates, err := report.findPITRBaseCandidates(backups)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates.names) == 0 ||
+			candidates.previousRestoreTime.T != 50 || candidates.restoreTime.T != 300 {
+			t.Fatalf("candidates = %+v, want projected range 50-300", candidates)
+		}
+		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 100, End: 300}}) {
+			t.Fatal("purged chain members cannot replace the surviving PITR base")
+		}
+		report.protectPITRAnchors(candidates.names, backups, backups)
+
+		if !reflect.DeepEqual(report.BackupsPurged, []string{"standalone"}) {
+			t.Fatalf("BackupsPurged = %v, want standalone", report.BackupsPurged)
+		}
+		if !reflect.DeepEqual(report.DeleteTargets, []string{"standalone"}) {
+			t.Fatalf("DeleteTargets = %v, want standalone", report.DeleteTargets)
+		}
+	})
+
+	t.Run("survivor at incremental root timestamp remains eligible", func(t *testing.T) {
+		backups := []backup.BackupMeta{
+			withLastWrite(mockTypedBcp("survivor", 0, now, defs.StatusDone, defs.LogicalBackup), 100),
+			withLastWrite(mockIncrementalBcp("inc-1", "base", 10, now, defs.StatusDone), 300),
+			withLastWrite(mockTypedBcp("standalone", 20, now, defs.StatusDone, defs.LogicalBackup), 200),
+			withLastWrite(mockIncrementalBcp("base", "", 30, now, defs.StatusDone), 100),
+		}
+		report := Evaluate(cfg, backups, true, now)
+
+		candidates, err := report.findPITRBaseCandidates(backups)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates.names) == 0 ||
+			candidates.previousRestoreTime.T != 100 || candidates.restoreTime.T != 300 {
+			t.Fatalf("candidates = %+v, want projected range 100-300", candidates)
+		}
+		if isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 50, End: 300}}) {
+			t.Fatal("surviving snapshot can replace the incremental chain")
+		}
+	})
+
+	t.Run("equal latest restore timestamps", func(t *testing.T) {
+		backups := []backup.BackupMeta{
+			withLastWrite(mockTypedBcp("survivor", 0, now, defs.StatusDone, defs.LogicalBackup), 100),
+			withLastWrite(mockTypedBcp("zeta", 10, now, defs.StatusDone, defs.LogicalBackup), 300),
+			withLastWrite(mockTypedBcp("alpha", 20, now, defs.StatusDone, defs.LogicalBackup), 300),
+		}
+		report := Evaluate(cfg, backups, true, now)
+
+		candidates, err := report.findPITRBaseCandidates(backups)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates.names) == 0 {
+			t.Fatal("PITR base candidates not found")
+		}
+		if !reflect.DeepEqual(candidates.names, []string{"alpha", "zeta"}) {
+			t.Fatalf("names = %v, want deterministic ties", candidates.names)
+		}
+		if candidates.previousRestoreTime.T != 100 || candidates.restoreTime.T != 300 {
+			t.Fatalf("candidates = %+v, want range 100-300", candidates)
+		}
+		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 150, End: 400}}) {
+			t.Fatal("tied candidates should be required for PITR")
+		}
+		report.protectPITRAnchors(candidates.names, backups, backups)
+
+		if len(report.BackupsPurged) != 0 || len(report.DeleteTargets) != 0 {
+			t.Fatalf("tied PITR bases remained purgeable: %+v", report)
+		}
+		for _, name := range []string{"alpha", "zeta"} {
+			if !reflect.DeepEqual(report.KeepReasons[name], []string{pitrBaseSnapshotReason}) {
+				t.Errorf("%s reasons = %v, want %q", name, report.KeepReasons[name], pitrBaseSnapshotReason)
+			}
+		}
+	})
+
+	t.Run("ineligible newer backups", func(t *testing.T) {
+		selective := withLastWrite(
+			mockTypedBcp("selective", 20, now, defs.StatusDone, defs.LogicalBackup),
+			500,
+		)
+		selective.Namespaces = []string{"db.collection"}
+		backups := []backup.BackupMeta{
+			withLastWrite(mockTypedBcp("survivor", 0, now, defs.StatusDone, defs.LogicalBackup), 100),
+			withLastWrite(mockTypedBcp("candidate", 10, now, defs.StatusDone, defs.LogicalBackup), 300),
+			selective,
+			withLastWrite(mockTypedBcp("external", 30, now, defs.StatusDone, defs.ExternalBackup), 600),
+		}
+		report := Evaluate(cfg, backups, true, now)
+
+		candidates, err := report.findPITRBaseCandidates(backups)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates.names) == 0 || !reflect.DeepEqual(candidates.names, []string{"candidate"}) {
+			t.Fatalf("candidates = %+v, want candidate despite newer ineligible backups", candidates)
+		}
+	})
+
+	t.Run("no previous survivor", func(t *testing.T) {
+		backups := []backup.BackupMeta{
+			withLastWrite(mockTypedBcp("candidate", 10, now, defs.StatusDone, defs.LogicalBackup), 300),
+		}
+		report := Evaluate(cfg, backups, true, now)
+
+		candidates, err := report.findPITRBaseCandidates(backups)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates.names) == 0 || !candidates.previousRestoreTime.IsZero() {
+			t.Fatalf("candidates = %+v, want no previous survivor", candidates)
+		}
+		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 150, End: 400}}) {
+			t.Fatal("candidate without a previous survivor should be required for PITR")
+		}
+	})
+
+	t.Run("timeline starts at previous survivor", func(t *testing.T) {
+		previousRestoreTime := bson.Timestamp{T: 150}
+		if isRequiredPITRBase(previousRestoreTime, []oplog.Timeline{{Start: 150, End: 400}}) {
+			t.Fatal("candidate should not be required when the previous survivor starts the timeline")
+		}
+	})
+
+	t.Run("discontinuous timeline", func(t *testing.T) {
+		backups := []backup.BackupMeta{
+			withLastWrite(mockTypedBcp("survivor", 0, now, defs.StatusDone, defs.LogicalBackup), 100),
+			withLastWrite(mockTypedBcp("candidate", 10, now, defs.StatusDone, defs.LogicalBackup), 300),
+		}
+		report := Evaluate(cfg, backups, true, now)
+
+		candidates, err := report.findPITRBaseCandidates(backups)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates.names) == 0 {
+			t.Fatal("PITR base candidate not found")
+		}
+		timelines := []oplog.Timeline{{Start: 150, End: 200}, {Start: 250, End: 300}}
+		if isRequiredPITRBase(candidates.previousRestoreTime, timelines) {
+			t.Fatal("candidate should not be required across a discontinuous timeline")
+		}
+		if !reflect.DeepEqual(report.BackupsPurged, []string{"candidate"}) {
+			t.Fatalf("BackupsPurged = %v, want candidate", report.BackupsPurged)
+		}
+	})
+
+	t.Run("no timeline", func(t *testing.T) {
+		if isRequiredPITRBase(bson.Timestamp{T: 100}, nil) {
+			t.Fatal("candidate should not be required without a PITR timeline")
+		}
+	})
+}
+
+func TestSortDeleteTargetsByRestoreTime(t *testing.T) {
+	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
+	minKeep := 0
+	backups := []backup.BackupMeta{
+		withLastWrite(mockIncrementalBcp("inc-1", "base", 10, now, defs.StatusDone), 200),
+		withLastWrite(mockTypedBcp("old", 20, now, defs.StatusDone, defs.LogicalBackup), 100),
+		withLastWrite(mockTypedBcp("new", 30, now, defs.StatusDone, defs.LogicalBackup), 300),
+		withLastWrite(mockIncrementalBcp("base", "", 40, now, defs.StatusDone), 150),
+	}
+	report := Evaluate(config.LifecycleConf{
+		Enabled: true,
+		MinKeep: &minKeep,
+	}, backups, true, now)
+
+	report.sortDeleteTargets(backups)
+	want := []string{"new", "base", "old"}
+	if !reflect.DeepEqual(report.DeleteTargets, want) {
+		t.Fatalf("DeleteTargets = %v, want newest-first %v", report.DeleteTargets, want)
+	}
+}
+
 func TestEvaluateProtectedIncrementRetainsChain(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	minKeep := 0
@@ -635,7 +974,7 @@ func TestEvaluateProtectsSuccessfulChainSplitAcrossStorageLocations(t *testing.T
 	}
 }
 
-func TestEvaluateAllowsFailedAttemptOnDifferentStorage(t *testing.T) {
+func TestEvaluateAllowsFailedAttemptAfterStorageChange(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	minKeep := 0
 	backups := []backup.BackupMeta{
@@ -643,7 +982,6 @@ func TestEvaluateAllowsFailedAttemptOnDifferentStorage(t *testing.T) {
 		mockIncrementalBcp("base", "", 30, now, defs.StatusDone),
 	}
 	backups[0].Store.Filesystem.Path = "/other-backups"
-	backups[0].PBMVersion = "2.15.0"
 
 	report := Evaluate(config.LifecycleConf{
 		Enabled:     true,
@@ -660,31 +998,6 @@ func TestEvaluateAllowsFailedAttemptOnDifferentStorage(t *testing.T) {
 	}
 	if len(report.KeepReasons) != 0 {
 		t.Fatalf("KeepReasons = %v, want none", report.KeepReasons)
-	}
-}
-
-func TestEvaluateProtectsLegacyFailedAttemptOnDifferentStorage(t *testing.T) {
-	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
-	minKeep := 0
-	backups := []backup.BackupMeta{
-		mockIncrementalBcp("failed-attempt", "base", 10, now, defs.StatusError),
-		mockIncrementalBcp("base", "", 30, now, defs.StatusDone),
-	}
-	backups[0].Store.Filesystem.Path = "/other-backups"
-	backups[0].PBMVersion = "2.5.0"
-
-	report := Evaluate(config.LifecycleConf{
-		Enabled:     true,
-		PurgeFailed: true,
-		MinKeep:     &minKeep,
-	}, backups, false, now)
-
-	wantKept := []string{"failed-attempt", "base"}
-	if !reflect.DeepEqual(report.BackupsKept, wantKept) {
-		t.Fatalf("BackupsKept = %v, want %v", report.BackupsKept, wantKept)
-	}
-	if len(report.BackupsPurged) != 0 || len(report.DeleteTargets) != 0 {
-		t.Fatalf("legacy cross-storage chain should be protected: %+v", report)
 	}
 }
 

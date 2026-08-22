@@ -8,13 +8,15 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/mod/semver"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/percona/percona-backup-mongodb/pbm/backup"
 	"github.com/percona/percona-backup-mongodb/pbm/config"
 	"github.com/percona/percona-backup-mongodb/pbm/connect"
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
 	"github.com/percona/percona-backup-mongodb/pbm/errors"
+	"github.com/percona/percona-backup-mongodb/pbm/oplog"
+	"github.com/percona/percona-backup-mongodb/pbm/util"
 )
 
 type Report struct {
@@ -32,12 +34,18 @@ type Report struct {
 const (
 	incrementalChainReason        = "Incremental Chain Retained"
 	invalidIncrementalChainReason = "Invalid Incremental Chain"
-	incrementalStorageGuard       = "v2.6.0"
+	pitrBaseSnapshotReason        = "PITR Base Snapshot"
 )
 
 type incrementalChain struct {
 	members []backup.BackupMeta
 	valid   bool
+}
+
+type pitrBaseCandidates struct {
+	names               []string
+	previousRestoreTime bson.Timestamp
+	restoreTime         bson.Timestamp
 }
 
 func (r *Report) addKeepReason(name, reason string) {
@@ -101,11 +109,36 @@ func EvaluateProfile(
 	}
 
 	selectedBackups := filterBackupsByProfile(allBackups, profile)
-	return evaluate(*cfg.Lifecycle, selectedBackups, allBackups, dryRun, now), nil
+	report := evaluate(*cfg.Lifecycle, selectedBackups, allBackups, dryRun, now)
+
+	pitrEnabled, oplogOnly := cfg.PITR.Enabled, cfg.PITR.OplogOnly
+	if profile != "" {
+		pitrEnabled, oplogOnly, err = config.IsPITREnabled(ctx, conn)
+		if err != nil {
+			return nil, errors.Wrap(err, "get PITR status")
+		}
+	}
+
+	if pitrEnabled && !oplogOnly && len(report.DeleteTargets) != 0 {
+		err = report.applyPITRDeleteChecks(ctx, conn, selectedBackups, allBackups)
+		if err != nil {
+			return nil, errors.Wrap(err, "apply PITR deletion checks")
+		}
+
+		if profile == "" && len(report.DeleteTargets) != 0 {
+			err = report.applyPITRProtection(ctx, conn, selectedBackups, allBackups)
+			if err != nil {
+				return nil, errors.Wrap(err, "apply PITR protection")
+			}
+		}
+	}
+
+	report.sortDeleteTargets(selectedBackups)
+	return report, nil
 }
 
 // buildIncrementalChains groups incremental metadata by its resolved base and
-// marks chains unsafe when they cross profile or successful-backup storage boundaries.
+// marks chains unsafe when they cross profiles or data-owning storage boundaries.
 func buildIncrementalChains(
 	allBackups []backup.BackupMeta,
 	selectedNames map[string]struct{},
@@ -146,7 +179,7 @@ func buildIncrementalChains(
 				chain.valid = false
 				break
 			}
-			if mustShareIncrementalStorage(member) &&
+			if member.Status == defs.StatusDone &&
 				!member.Store.IsSameStorage(&base.Store.StorageConf) {
 				chain.valid = false
 				break
@@ -156,20 +189,6 @@ func buildIncrementalChains(
 	}
 
 	return append(chains, invalid...)
-}
-
-// mustShareIncrementalStorage identifies metadata that can own backup data.
-// Since v2.6, failed attempts reject a different storage before uploading files.
-func mustShareIncrementalStorage(bcp backup.BackupMeta) bool {
-	if bcp.Status == defs.StatusDone {
-		return true
-	}
-
-	v := bcp.PBMVersion
-	if !strings.HasPrefix(v, "v") {
-		v = "v" + v
-	}
-	return !semver.IsValid(v) || semver.Compare(v, incrementalStorageGuard) < 0
 }
 
 // findIncrementalBase follows source links to the base. Unresolvable links fail
@@ -236,9 +255,258 @@ func (r *Report) applyIncrementalChainRules(selectedBackups, allBackups []backup
 	}
 }
 
+// isMainPITRBaseSnapshot mirrors automatic PITR base selection. A profile
+// backup may still be selected explicitly for restore with --base-snapshot.
+func isMainPITRBaseSnapshot(bcp backup.BackupMeta) bool {
+	return !bcp.Store.IsProfile &&
+		bcp.Status == defs.StatusDone &&
+		bcp.Type != defs.ExternalBackup &&
+		!util.IsSelective(bcp.Namespaces)
+}
+
+// applyPITRDeleteChecks ensures lifecycle never proposes a deletion that the
+// checked delete-backup path would reject for PITR safety.
+func (r *Report) applyPITRDeleteChecks(
+	ctx context.Context,
+	conn connect.Client,
+	selectedBackups, allBackups []backup.BackupMeta,
+) error {
+	byName := make(map[string]backup.BackupMeta, len(selectedBackups))
+	for _, bcp := range selectedBackups {
+		byName[bcp.Name] = bcp
+	}
+
+	protected := make(map[string]struct{})
+	for _, name := range r.DeleteTargets {
+		bcp, ok := byName[name]
+		if !ok {
+			return errors.Errorf("PITR deletion target %q not found", name)
+		}
+
+		anchor := bcp.Name
+		var err error
+		if bcp.Type == defs.IncrementalBackup {
+			var increments [][]*backup.BackupMeta
+			increments, err = backup.FetchAllIncrements(ctx, conn, &bcp)
+			if err == nil {
+				err = backup.CanDeleteIncrementalChain(ctx, conn, &bcp, increments)
+			}
+			for _, attempts := range increments {
+				for _, increment := range attempts {
+					if increment.Status == defs.StatusDone {
+						anchor = increment.Name
+					}
+				}
+			}
+		} else {
+			err = backup.CanDeleteBackup(ctx, conn, &bcp)
+		}
+
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, backup.ErrBaseForPITR) {
+			return errors.Wrapf(err, "check whether backup %q can be deleted", name)
+		}
+		protected[anchor] = struct{}{}
+	}
+
+	if len(protected) == 0 {
+		return nil
+	}
+
+	anchors := make([]string, 0, len(protected))
+	for name := range protected {
+		anchors = append(anchors, name)
+	}
+	slices.Sort(anchors)
+	r.protectPITRAnchors(anchors, selectedBackups, allBackups)
+	return nil
+}
+
+// applyPITRProtection retains the newest deletion unit or tied units when they
+// are the only bases for the active main-storage PITR timeline.
+func (r *Report) applyPITRProtection(
+	ctx context.Context,
+	conn connect.Client,
+	selectedBackups, allBackups []backup.BackupMeta,
+) error {
+	candidates, err := r.findPITRBaseCandidates(selectedBackups)
+	if err != nil || len(candidates.names) == 0 {
+		return err
+	}
+
+	timelines, err := oplog.PITRTimelinesBetween(
+		ctx,
+		conn,
+		candidates.previousRestoreTime,
+		candidates.restoreTime,
+	)
+	if err != nil {
+		return errors.Wrap(err, "get PITR timelines")
+	}
+	if !isRequiredPITRBase(candidates.previousRestoreTime, timelines) {
+		return nil
+	}
+
+	r.protectPITRAnchors(candidates.names, selectedBackups, allBackups)
+	return nil
+}
+
+func (r *Report) protectPITRAnchors(
+	anchorNames []string,
+	selectedBackups, allBackups []backup.BackupMeta,
+) {
+	for _, name := range anchorNames {
+		r.addKeepReason(name, pitrBaseSnapshotReason)
+	}
+	// A protected incremental base retains its complete deletion unit.
+	r.applyIncrementalChainRules(selectedBackups, allBackups)
+	r.buildBackupLists(selectedBackups)
+}
+
+func (r *Report) findPITRBaseCandidates(backups []backup.BackupMeta) (pitrBaseCandidates, error) {
+	purged := make(map[string]struct{}, len(r.BackupsPurged))
+	for _, name := range r.BackupsPurged {
+		purged[name] = struct{}{}
+	}
+
+	var latest []backup.BackupMeta
+	var latestWrite bson.Timestamp
+	for _, bcp := range backups {
+		if _, ok := purged[bcp.Name]; !ok {
+			continue
+		}
+		if !isMainPITRBaseSnapshot(bcp) {
+			continue
+		}
+
+		switch bcp.LastWriteTS.Compare(latestWrite) {
+		case 1:
+			latestWrite = bcp.LastWriteTS
+			latest = []backup.BackupMeta{bcp}
+		case 0:
+			latest = append(latest, bcp)
+		}
+	}
+	if len(latest) == 0 {
+		return pitrBaseCandidates{}, nil
+	}
+
+	var previousSnapshot bson.Timestamp
+	for _, bcp := range backups {
+		if !isMainPITRBaseSnapshot(bcp) {
+			continue
+		}
+		if _, ok := purged[bcp.Name]; ok {
+			continue
+		}
+
+		switch bcp.LastWriteTS.Compare(latestWrite) {
+		case 1:
+			// A newer surviving snapshot can base the active PITR timeline.
+			return pitrBaseCandidates{}, nil
+		case -1:
+			if previousSnapshot.Compare(bcp.LastWriteTS) < 0 {
+				previousSnapshot = bcp.LastWriteTS
+			}
+		}
+	}
+
+	byName := make(map[string]backup.BackupMeta, len(backups))
+	for _, bcp := range backups {
+		if bcp.Type == defs.IncrementalBackup {
+			byName[bcp.Name] = bcp
+		}
+	}
+
+	deleteTargets := make(map[string]struct{}, len(r.DeleteTargets))
+	for _, name := range r.DeleteTargets {
+		deleteTargets[name] = struct{}{}
+	}
+
+	anchorNames := make([]string, 0, len(latest))
+	for _, bcp := range latest {
+		target := bcp.Name
+		if bcp.Type == defs.IncrementalBackup {
+			base, ok := findIncrementalBase(bcp, byName)
+			if !ok {
+				return pitrBaseCandidates{},
+					errors.Errorf("resolve PITR base for incremental backup %q", bcp.Name)
+			}
+			target = base.Name
+		}
+		if _, ok := deleteTargets[target]; !ok {
+			return pitrBaseCandidates{}, errors.Errorf("PITR deletion target %q not found", target)
+		}
+
+		anchorNames = append(anchorNames, bcp.Name)
+	}
+	slices.Sort(anchorNames)
+
+	return pitrBaseCandidates{
+		names:               anchorNames,
+		previousRestoreTime: previousSnapshot,
+		restoreTime:         latestWrite,
+	}, nil
+}
+
+func isRequiredPITRBase(previousRestoreTime bson.Timestamp, timelines []oplog.Timeline) bool {
+	return len(timelines) == 1 && previousRestoreTime.T < timelines[0].Start
+}
+
+// sortDeleteTargets keeps report targets newest-first so the agent's reverse
+// iteration executes deletion units oldest-first by their restore timestamp.
+func (r *Report) sortDeleteTargets(backups []backup.BackupMeta) {
+	if len(r.DeleteTargets) < 2 {
+		return
+	}
+
+	targets := make(map[string]struct{}, len(r.DeleteTargets))
+	for _, name := range r.DeleteTargets {
+		targets[name] = struct{}{}
+	}
+
+	byName := make(map[string]backup.BackupMeta, len(backups))
+	for _, bcp := range backups {
+		if bcp.Type == defs.IncrementalBackup {
+			byName[bcp.Name] = bcp
+		}
+	}
+
+	restoreTS := make(map[string]bson.Timestamp, len(r.DeleteTargets))
+	for _, bcp := range backups {
+		target := bcp.Name
+		if bcp.Type == defs.IncrementalBackup {
+			base, ok := findIncrementalBase(bcp, byName)
+			if !ok {
+				continue
+			}
+			target = base.Name
+		}
+		if _, ok := targets[target]; !ok {
+			continue
+		}
+		if bcp.Status == defs.StatusDone && restoreTS[target].Compare(bcp.LastWriteTS) < 0 {
+			restoreTS[target] = bcp.LastWriteTS
+		}
+	}
+
+	slices.SortFunc(r.DeleteTargets, func(a, b string) int {
+		if cmp := restoreTS[a].Compare(restoreTS[b]); cmp != 0 {
+			return -cmp
+		}
+		return strings.Compare(b, a)
+	})
+}
+
 // buildBackupLists materializes the final report after all keep decisions have
 // been made. Incremental deletion targets contain only chain bases.
 func (r *Report) buildBackupLists(backups []backup.BackupMeta) {
+	r.BackupsKept = nil
+	r.BackupsPurged = nil
+	r.DeleteTargets = nil
+
 	for _, bcp := range backups {
 		if bcp.Status.IsRunning() {
 			continue
