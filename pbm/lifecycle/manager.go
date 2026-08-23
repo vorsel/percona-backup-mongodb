@@ -115,7 +115,10 @@ func isCompleteIncrementalRestorePoint(
 func filterBackupsByProfile(backups []backup.BackupMeta, profile string) []backup.BackupMeta {
 	filtered := make([]backup.BackupMeta, 0, len(backups))
 	for _, bcp := range backups {
-		if bcp.Store.Name != profile {
+		if profile == "" && bcp.Store.IsProfile {
+			continue
+		}
+		if profile != "" && (!bcp.Store.IsProfile || bcp.Store.Name != profile) {
 			continue
 		}
 
@@ -660,6 +663,7 @@ func evaluateRetentionPolicy(
 	allBackups []backup.BackupMeta,
 	now time.Time,
 ) *Report {
+	now = now.UTC().Truncate(time.Second)
 	report := &Report{
 		ConfigUsed:  cfg,
 		KeepReasons: make(map[string][]string),
@@ -684,19 +688,18 @@ func evaluateRetentionPolicy(
 	weeklyCandidates := make(map[string][]backup.BackupMeta)
 	monthlyCandidates := make(map[string][]backup.BackupMeta)
 
-	// 1. Bucketing phase
 	for _, bcp := range selectedBackups {
 		if bcp.Status.IsRunning() {
 			continue
 		}
 
 		bcpTime := time.Unix(bcp.StartTS, 0).UTC()
-		if bcpTime.After(now) {
-			report.addKeepReason(bcp.Name, afterEvaluationReason)
-			continue
-		}
 		if util.IsSelective(bcp.Namespaces) {
 			report.addKeepReason(bcp.Name, selectiveBackupReason)
+			continue
+		}
+		if !bcpTime.Before(now) {
+			report.addKeepReason(bcp.Name, afterEvaluationReason)
 			continue
 		}
 

@@ -22,6 +22,9 @@ import (
 // daysAgo subtracts from the baseTime (our frozen mockNow).
 func mockBcp(name string, daysAgo int, baseTime time.Time, status defs.Status) backup.BackupMeta {
 	bcpTime := baseTime.AddDate(0, 0, -daysAgo)
+	if daysAgo == 0 {
+		bcpTime = bcpTime.Add(-time.Second)
+	}
 	return backup.BackupMeta{
 		Name:    name,
 		StartTS: bcpTime.Unix(),
@@ -66,8 +69,10 @@ func withLastWrite(bcp backup.BackupMeta, ts uint32) backup.BackupMeta {
 func TestFilterBackupsByProfile(t *testing.T) {
 	backups := []backup.BackupMeta{
 		{Name: "main"},
+		{Name: "named-main", Store: backup.Storage{Name: "archive"}},
 		{Name: "archive", Store: backup.Storage{Name: "archive", IsProfile: true}},
 		{Name: "other", Store: backup.Storage{Name: "other", IsProfile: true}},
+		{Name: "unnamed-profile", Store: backup.Storage{IsProfile: true}},
 	}
 
 	tests := []struct {
@@ -77,7 +82,7 @@ func TestFilterBackupsByProfile(t *testing.T) {
 	}{
 		{
 			name: "main storage",
-			want: []string{"main"},
+			want: []string{"main", "named-main"},
 		},
 		{
 			name:    "named profile",
@@ -520,19 +525,23 @@ func TestEvaluateExcludesSelectiveAndManagesExternal(t *testing.T) {
 }
 
 func TestEvaluateProtectsBackupsCreatedAfterEvaluation(t *testing.T) {
-	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+	now := time.Date(2026, time.March, 18, 12, 0, 0, 500_000_000, time.UTC)
 	minKeep := 0
+	sameSecond := mockTypedBcp("same-second", 0, now, defs.StatusDone, defs.LogicalBackup)
+	sameSecond.StartTS = now.Unix()
 	future := mockTypedBcp("future", -1, now, defs.StatusDone, defs.LogicalBackup)
 	report := Evaluate(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
-	}, []backup.BackupMeta{future}, now)
+	}, []backup.BackupMeta{sameSecond, future}, now)
 
-	if !reflect.DeepEqual(report.KeepReasons["future"], []string{afterEvaluationReason}) {
-		t.Fatalf("future backup reasons = %v, want evaluation-time protection", report.KeepReasons["future"])
+	for _, name := range []string{"same-second", "future"} {
+		if !reflect.DeepEqual(report.KeepReasons[name], []string{afterEvaluationReason}) {
+			t.Errorf("%s backup reasons = %v, want evaluation-time protection", name, report.KeepReasons[name])
+		}
 	}
 	if len(report.DeleteTargets) != 0 {
-		t.Fatalf("future backup became a deletion target: %v", report.DeleteTargets)
+		t.Fatalf("evaluation-time-protected backup became a deletion target: %v", report.DeleteTargets)
 	}
 }
 

@@ -75,7 +75,7 @@ func deleteBackup(
 		return &outMsg{""}, nil
 	}
 
-	return waitForDelete(ctx, conn, pbm, cid)
+	return waitForDelete(ctx, conn, pbm, cid, os.Stdout)
 }
 
 func deleteBackupByName(ctx context.Context, pbm *sdk.Client, d *deleteBcpOpts) (sdk.CommandID, error) {
@@ -250,7 +250,7 @@ func deletePITR(
 		defer cancel()
 	}
 
-	rv, err := waitForDelete(ctx, conn, pbm, cid)
+	rv, err := waitForDelete(ctx, conn, pbm, cid, os.Stdout)
 	if errors.Is(err, context.DeadlineExceeded) {
 		err = errWaitTimeout
 	}
@@ -357,7 +357,7 @@ func doCleanupOlderThan(
 		defer cancel()
 	}
 
-	rv, err := waitForDelete(ctx, conn, pbm, cid)
+	rv, err := waitForDelete(ctx, conn, pbm, cid, os.Stdout)
 	if errors.Is(err, context.DeadlineExceeded) {
 		err = errWaitTimeout
 	}
@@ -406,7 +406,15 @@ func doLifecycleCleanup(
 	}
 
 	if !d.yes {
-		if err := askConfirmation("Are you sure you want to permanently delete the purged backups?"); err != nil {
+		promptOut := os.Stdout
+		if out != outText {
+			promptOut = os.Stderr
+			fmt.Fprintln(promptOut, report.String())
+		}
+		if err := askConfirmationTo(
+			promptOut,
+			"Are you sure you want to permanently delete the purged backups?",
+		); err != nil {
 			if !errors.Is(err, errUserCanceled) {
 				return nil, err
 			}
@@ -430,9 +438,23 @@ func doLifecycleCleanup(
 		defer cancel()
 	}
 
-	rv, err := waitForDelete(ctx, conn, pbm, cid)
+	progressOut := os.Stdout
+	if out != outText {
+		progressOut = os.Stderr
+	}
+	rv, err := waitForDelete(ctx, conn, pbm, cid, progressOut)
 	if errors.Is(err, context.DeadlineExceeded) {
 		err = errWaitTimeout
+	}
+	if err == nil && out != outText {
+		result.Msg = "Lifecycle cleanup completed."
+		switch rv := rv.(type) {
+		case outMsg:
+			result.Msg = rv.Msg
+		case *outMsg:
+			result.Msg = rv.Msg
+		}
+		return result, nil
 	}
 	return rv, err
 }
@@ -538,17 +560,20 @@ func waitForDelete(
 	conn connect.Client,
 	pbm *sdk.Client,
 	cid sdk.CommandID,
+	progressOut io.Writer,
 ) (fmt.Stringer, error) {
 	commandCtx, stopProgress := context.WithCancel(ctx)
 	defer stopProgress()
 
 	go func() {
-		fmt.Print("Waiting for delete to be done ")
+		fmt.Fprint(progressOut, "Waiting for delete to be done ")
 
-		for tick := time.NewTicker(time.Second); ; {
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		for {
 			select {
 			case <-tick.C:
-				fmt.Print(".")
+				fmt.Fprint(progressOut, ".")
 			case <-commandCtx.Done():
 				return
 			}
@@ -590,6 +615,6 @@ func waitForDelete(
 	}
 
 	stopProgress()
-	fmt.Println("[done]")
+	fmt.Fprintln(progressOut, "[done]")
 	return runList(ctx, conn, pbm, &listOpts{})
 }
