@@ -583,10 +583,6 @@ func getStorageStat(
 	}
 	bcps = filterByProfile(bcps, profile)
 
-	inf, err := topo.GetNodeInfoExt(ctx, conn.MongoClient())
-	if err != nil {
-		return s, errors.Wrap(err, "define cluster state")
-	}
 	ver, err := version.GetMongoVersion(ctx, conn.MongoClient())
 	if err != nil {
 		return nil, errors.Wrap(err, "get mongo version")
@@ -603,13 +599,6 @@ func getStorageStat(
 
 	bcpsMatchCluster(bcps, ver.VersionString, fcv, shards, rsMap)
 
-	l := log.FromContext(ctx).NewEvent("", "", "", bson.Timestamp{})
-	stg, err := util.GetStorage(ctx, conn, inf.Me, l)
-	if err != nil {
-		return s, errors.Wrap(err, "get storage")
-	}
-	defer storage.Close(stg, l)
-
 	now, err := topo.GetClusterTime(ctx, conn)
 	if err != nil {
 		return nil, errors.Wrap(err, "get cluster time")
@@ -619,6 +608,7 @@ func getStorageStat(
 		snpsht := snapshotStat{
 			Name:       bcp.Name,
 			Namespaces: bcp.Namespaces,
+			Size:       bcp.Size,
 			Status:     bcp.Status,
 			RestoreTS:  bcp.LastTransitionTS,
 			PBMVersion: bcp.PBMVersion,
@@ -651,15 +641,6 @@ func getStorageStat(
 				snpsht.Status = defs.StatusError
 				snpsht.PrintStatus = defs.StatusError.PrintStatus()
 			}
-		}
-
-		bcp := bcp
-		snpsht.Size, err = getBackupSize(&bcp, stg)
-		if err != nil {
-			snpsht.Err = err
-			snpsht.ErrString = err.Error()
-			snpsht.Status = defs.StatusError
-			snpsht.PrintStatus = defs.StatusError.PrintStatus()
 		}
 
 		s.Snapshot = append(s.Snapshot, snpsht)
@@ -765,77 +746,4 @@ func isValidBaseSnapshot(bcp *backup.BackupMeta) bool {
 	}
 
 	return false
-}
-
-func getBackupSize(bcp *backup.BackupMeta, stg storage.Storage) (int64, error) {
-	if bcp.Size > 0 {
-		return bcp.Size, nil
-	}
-
-	var s int64
-	var err error
-	switch bcp.Status {
-	case defs.StatusDone, defs.StatusCancelled, defs.StatusError:
-		s, err = getLegacySnapshotSize(bcp, stg)
-		if errors.Is(err, errMissedFile) && bcp.Status != defs.StatusDone {
-			// canceled/failed backup can be incomplete. ignore
-			err = nil
-		}
-	}
-
-	return s, err
-}
-
-func getLegacySnapshotSize(bcp *backup.BackupMeta, stg storage.Storage) (int64, error) {
-	switch bcp.Type {
-	case defs.LogicalBackup:
-		return getLegacyLogicalSize(bcp, stg)
-	case defs.PhysicalBackup, defs.IncrementalBackup:
-		return getLegacyPhysSize(bcp.Replsets)
-	case defs.ExternalBackup:
-		return 0, nil
-	default:
-		return 0, errors.Errorf("unknown backup type %s", bcp.Type)
-	}
-}
-
-func getLegacyPhysSize(rsets []backup.BackupReplset) (int64, error) {
-	var s int64
-	for _, rs := range rsets {
-		for _, f := range rs.Files {
-			s += f.StgSize
-		}
-	}
-
-	return s, nil
-}
-
-var errMissedFile = errors.New("missed file")
-
-func getLegacyLogicalSize(bcp *backup.BackupMeta, stg storage.Storage) (int64, error) {
-	var s int64
-	var err error
-	for _, rs := range bcp.Replsets {
-		ds, er := stg.FileStat(rs.DumpName)
-		if er != nil {
-			if bcp.Status == defs.StatusDone || !errors.Is(er, storage.ErrNotExist) {
-				return s, errors.Wrapf(er, "get file %s", rs.DumpName)
-			}
-
-			err = errMissedFile
-		}
-
-		op, er := stg.FileStat(rs.OplogName)
-		if er != nil {
-			if bcp.Status == defs.StatusDone || !errors.Is(er, storage.ErrNotExist) {
-				return s, errors.Wrapf(er, "get file %s", rs.OplogName)
-			}
-
-			err = errMissedFile
-		}
-
-		s += ds.Size + op.Size
-	}
-
-	return s, err
 }
