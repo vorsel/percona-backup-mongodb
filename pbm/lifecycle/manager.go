@@ -3,7 +3,6 @@ package lifecycle
 import (
 	"context"
 	"fmt"
-	"math"
 	"slices"
 	"strings"
 	"time"
@@ -36,6 +35,8 @@ const (
 	incrementalChainReason        = "Incremental Chain Retained"
 	invalidIncrementalChainReason = "Invalid Incremental Chain"
 	pitrBaseSnapshotReason        = "PITR Base Snapshot"
+	afterEvaluationReason         = "Created After Evaluation"
+	selectiveBackupReason         = "Selective Backup (Excluded)"
 )
 
 type incrementalChain struct {
@@ -153,8 +154,10 @@ func BuildReport(
 	selectedBackups := filterBackupsByProfile(allBackups, profile)
 	report := evaluateRetentionPolicy(*cfg.Lifecycle, selectedBackups, allBackups, now)
 
-	pitrEnabled, oplogOnly := cfg.PITR.Enabled, cfg.PITR.OplogOnly
-	if profile != "" {
+	var pitrEnabled, oplogOnly bool
+	if profile == "" {
+		pitrEnabled, oplogOnly = cfg.PITR.Enabled, cfg.PITR.OplogOnly
+	} else {
 		pitrEnabled, oplogOnly, err = config.IsPITREnabled(ctx, conn)
 		if err != nil {
 			return nil, errors.Wrap(err, "get PITR status")
@@ -677,8 +680,6 @@ func evaluateRetentionPolicy(
 	isCalendar := cfg.GetStrategy() == config.LifecycleStrategyCalendar
 
 	dailyCutoff := now.AddDate(0, 0, -cfg.DailyRetention)
-	weeklyCutoff := now.AddDate(0, 0, -(cfg.WeeklyRetention * 7))
-	monthlyCutoff := now.AddDate(0, -cfg.MonthlyRetention, 0)
 
 	weeklyCandidates := make(map[string][]backup.BackupMeta)
 	monthlyCandidates := make(map[string][]backup.BackupMeta)
@@ -690,7 +691,14 @@ func evaluateRetentionPolicy(
 		}
 
 		bcpTime := time.Unix(bcp.StartTS, 0).UTC()
-		ageInDays := int(now.Sub(bcpTime).Hours() / 24)
+		if bcpTime.After(now) {
+			report.addKeepReason(bcp.Name, afterEvaluationReason)
+			continue
+		}
+		if util.IsSelective(bcp.Namespaces) {
+			report.addKeepReason(bcp.Name, selectiveBackupReason)
+			continue
+		}
 
 		if bcp.Status == defs.StatusError || bcp.Status == defs.StatusCancelled {
 			if !cfg.PurgeFailed {
@@ -705,34 +713,28 @@ func evaluateRetentionPolicy(
 
 		if cfg.DailyRetention > 0 && !bcpTime.Before(dailyCutoff) {
 			report.addKeepReason(bcp.Name, "Daily")
-			continue
 		}
 
 		// Weekly Retention Bucket
-		if cfg.WeeklyRetention > 0 && !bcpTime.Before(weeklyCutoff) {
+		if cfg.WeeklyRetention > 0 {
+			bucket := rollingBucketIndex(now, bcpTime, 7*24*time.Hour)
 			if isCalendar {
-				year, week := bcpTime.ISOWeek()
-				// Append the backup Type to the bucket key
-				weekKey := fmt.Sprintf("calendar-week-%d-W%02d-%s", year, week, bcp.Type)
-				weeklyCandidates[weekKey] = append(weeklyCandidates[weekKey], bcp)
-			} else {
-				weekBucket := ageInDays / 7
-				// Append the backup Type to the bucket key
-				weekKey := fmt.Sprintf("rolling-week-%d-%s", weekBucket, bcp.Type)
+				bucket = calendarWeekIndex(now, bcpTime)
+			}
+			if bucket >= 0 && bucket < cfg.WeeklyRetention {
+				weekKey := fmt.Sprintf("week-%d-%s", bucket, bcp.Type)
 				weeklyCandidates[weekKey] = append(weeklyCandidates[weekKey], bcp)
 			}
 		}
 
 		// Monthly Retention Bucket
-		if cfg.MonthlyRetention > 0 && !bcpTime.Before(monthlyCutoff) {
+		if cfg.MonthlyRetention > 0 {
+			bucket := rollingBucketIndex(now, bcpTime, 30*24*time.Hour)
 			if isCalendar {
-				// Append the backup Type to the bucket key
-				monthKey := fmt.Sprintf("%s-%s", bcpTime.Format("2006-01"), bcp.Type)
-				monthlyCandidates[monthKey] = append(monthlyCandidates[monthKey], bcp)
-			} else {
-				monthBucket := ageInDays / 30
-				// Append the backup Type to the bucket key
-				monthKey := fmt.Sprintf("rolling-month-%d-%s", monthBucket, bcp.Type)
+				bucket = calendarMonthIndex(now, bcpTime)
+			}
+			if bucket >= 0 && bucket < cfg.MonthlyRetention {
+				monthKey := fmt.Sprintf("month-%d-%s", bucket, bcp.Type)
 				monthlyCandidates[monthKey] = append(monthlyCandidates[monthKey], bcp)
 			}
 		}
@@ -759,6 +761,28 @@ func evaluateRetentionPolicy(
 	return report
 }
 
+func rollingBucketIndex(now, backupTime time.Time, width time.Duration) int {
+	age := now.Sub(backupTime)
+	if age < 0 {
+		age = 0
+	}
+	return int(age / width)
+}
+
+func calendarWeekIndex(now, backupTime time.Time) int {
+	return int(startOfISOWeek(now).Sub(startOfISOWeek(backupTime)) / (7 * 24 * time.Hour))
+}
+
+func startOfISOWeek(t time.Time) time.Time {
+	t = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	daysSinceMonday := (int(t.Weekday()) + 6) % 7
+	return t.AddDate(0, 0, -daysSinceMonday)
+}
+
+func calendarMonthIndex(now, backupTime time.Time) int {
+	return (now.Year()-backupTime.Year())*12 + int(now.Month()-backupTime.Month())
+}
+
 // findBestCandidate selects the optimal backup from a bucket.
 func findBestCandidate(
 	candidates []backup.BackupMeta,
@@ -770,12 +794,11 @@ func findBestCandidate(
 		return nil
 	}
 
-	var best *backup.BackupMeta
-
 	if !isCalendar {
 		// Rolling Option: Pick the newest backup in this bucket
+		var best *backup.BackupMeta
 		for i := range candidates {
-			if best == nil || candidates[i].StartTS > best.StartTS {
+			if betterCandidate(&candidates[i], best) {
 				best = &candidates[i]
 			}
 		}
@@ -783,22 +806,46 @@ func findBestCandidate(
 	}
 
 	// Calendar Option: Find the backup closest to the targeted day
-	minDiff := 31 // Max possible difference
+	var best *backup.BackupMeta
+	minDiff := 0
 	for i, bcp := range candidates {
 		bcpTime := time.Unix(bcp.StartTS, 0).UTC()
-		diff := 0
+		target := calendarTargetDate(bcpTime, targetDayInt, isMonthly)
+		diff := dateDistance(bcpTime, target)
 
-		if isMonthly {
-			diff = int(math.Abs(float64(bcpTime.Day() - targetDayInt)))
-		} else {
-			diff = int(math.Abs(float64(bcpTime.Weekday() - time.Weekday(targetDayInt))))
-		}
-
-		if diff < minDiff {
+		if best == nil || diff < minDiff || diff == minDiff && betterCandidate(&candidates[i], best) {
 			minDiff = diff
 			best = &candidates[i]
 		}
 	}
 
 	return best
+}
+
+func calendarTargetDate(candidate time.Time, targetDay int, monthly bool) time.Time {
+	if !monthly {
+		offset := (targetDay - int(time.Monday) + 7) % 7
+		return startOfISOWeek(candidate).AddDate(0, 0, offset)
+	}
+
+	lastDay := time.Date(candidate.Year(), candidate.Month()+1, 0, 0, 0, 0, 0, time.UTC).Day()
+	if targetDay > lastDay {
+		targetDay = lastDay
+	}
+	return time.Date(candidate.Year(), candidate.Month(), targetDay, 0, 0, 0, 0, time.UTC)
+}
+
+func dateDistance(a, b time.Time) int {
+	a = time.Date(a.Year(), a.Month(), a.Day(), 0, 0, 0, 0, time.UTC)
+	distance := a.Sub(b)
+	if distance < 0 {
+		distance = -distance
+	}
+	return int(distance / (24 * time.Hour))
+}
+
+func betterCandidate(candidate, current *backup.BackupMeta) bool {
+	return current == nil ||
+		candidate.StartTS > current.StartTS ||
+		candidate.StartTS == current.StartTS && candidate.Name < current.Name
 }

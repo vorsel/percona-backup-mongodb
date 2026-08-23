@@ -178,8 +178,8 @@ func TestEvaluate(t *testing.T) {
 				mockBcp("bcp-9-days", 9, standardDate, defs.StatusDone),
 				mockBcp("bcp-12-days", 12, standardDate, defs.StatusDone), // Oldest in Week 1 bucket (Purged)
 			},
-			expectedKept:   []string{"bcp-today", "bcp-7-days", "bcp-9-days"},
-			expectedPurged: []string{"bcp-12-days"},
+			expectedKept:   []string{"bcp-today", "bcp-7-days"},
+			expectedPurged: []string{"bcp-9-days", "bcp-12-days"},
 		},
 		{
 			name: "Calendar Strategy - Exact match vs Nearest Neighbor",
@@ -317,6 +317,245 @@ func TestEvaluate(t *testing.T) {
 				t.Errorf("BackupsPurged = %v, want %v", report.BackupsPurged, tt.expectedPurged)
 			}
 		})
+	}
+}
+
+func TestEvaluateRollingBucketBoundaries(t *testing.T) {
+	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+	minKeep := 0
+
+	t.Run("weekly", func(t *testing.T) {
+		report := Evaluate(config.LifecycleConf{
+			Enabled:         true,
+			MinKeep:         &minKeep,
+			WeeklyRetention: 2,
+		}, []backup.BackupMeta{
+			mockTypedBcp("day-0", 0, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("day-6", 6, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("day-7", 7, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("day-13", 13, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("day-14", 14, now, defs.StatusDone, defs.LogicalBackup),
+		}, now)
+
+		if !reflect.DeepEqual(report.BackupsKept, []string{"day-0", "day-7"}) {
+			t.Fatalf("BackupsKept = %v, want day-0 and day-7", report.BackupsKept)
+		}
+		if !reflect.DeepEqual(report.BackupsPurged, []string{"day-6", "day-13", "day-14"}) {
+			t.Fatalf("BackupsPurged = %v, want exact two-bucket boundary", report.BackupsPurged)
+		}
+	})
+
+	t.Run("monthly", func(t *testing.T) {
+		report := Evaluate(config.LifecycleConf{
+			Enabled:          true,
+			MinKeep:          &minKeep,
+			MonthlyRetention: 2,
+		}, []backup.BackupMeta{
+			mockTypedBcp("day-0", 0, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("day-29", 29, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("day-30", 30, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("day-59", 59, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("day-60", 60, now, defs.StatusDone, defs.LogicalBackup),
+		}, now)
+
+		if !reflect.DeepEqual(report.BackupsKept, []string{"day-0", "day-30"}) {
+			t.Fatalf("BackupsKept = %v, want day-0 and day-30", report.BackupsKept)
+		}
+		if !reflect.DeepEqual(report.BackupsPurged, []string{"day-29", "day-59", "day-60"}) {
+			t.Fatalf("BackupsPurged = %v, want exact two-bucket boundary", report.BackupsPurged)
+		}
+	})
+}
+
+func TestEvaluateCalendarBucketsIncludeCurrentPeriod(t *testing.T) {
+	minKeep := 0
+
+	t.Run("weekly", func(t *testing.T) {
+		now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC) // Wednesday
+		report := Evaluate(config.LifecycleConf{
+			Enabled:         true,
+			Strategy:        config.LifecycleStrategyCalendar,
+			MinKeep:         &minKeep,
+			WeeklyRetention: 2,
+			WeeklyDay:       int(time.Friday),
+		}, []backup.BackupMeta{
+			mockTypedBcp("current-wednesday", 0, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("current-monday", 2, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("previous-friday", 5, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("previous-monday", 9, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("two-weeks-friday", 12, now, defs.StatusDone, defs.LogicalBackup),
+		}, now)
+
+		if !reflect.DeepEqual(report.BackupsKept, []string{"current-wednesday", "previous-friday"}) {
+			t.Fatalf("BackupsKept = %v, want current and previous calendar weeks", report.BackupsKept)
+		}
+	})
+
+	t.Run("monthly", func(t *testing.T) {
+		now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+		report := Evaluate(config.LifecycleConf{
+			Enabled:          true,
+			Strategy:         config.LifecycleStrategyCalendar,
+			MinKeep:          &minKeep,
+			MonthlyRetention: 2,
+			MonthlyDay:       15,
+		}, []backup.BackupMeta{
+			mockTypedBcp("march-15", 3, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("february-15", 31, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("january-15", 62, now, defs.StatusDone, defs.LogicalBackup),
+		}, now)
+
+		if !reflect.DeepEqual(report.BackupsKept, []string{"march-15", "february-15"}) {
+			t.Fatalf("BackupsKept = %v, want current and previous calendar months", report.BackupsKept)
+		}
+	})
+
+	t.Run("sunday target", func(t *testing.T) {
+		now := time.Date(2026, time.March, 22, 12, 0, 0, 0, time.UTC) // Sunday
+		report := Evaluate(config.LifecycleConf{
+			Enabled:         true,
+			Strategy:        config.LifecycleStrategyCalendar,
+			MinKeep:         &minKeep,
+			WeeklyRetention: 1,
+			WeeklyDay:       int(time.Sunday),
+		}, []backup.BackupMeta{
+			mockTypedBcp("monday", 6, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("saturday", 1, now, defs.StatusDone, defs.LogicalBackup),
+		}, now)
+
+		if !reflect.DeepEqual(report.BackupsKept, []string{"saturday"}) {
+			t.Fatalf("BackupsKept = %v, want Saturday as nearest Sunday neighbor", report.BackupsKept)
+		}
+	})
+
+	t.Run("equal distance prefers newest", func(t *testing.T) {
+		now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+		report := Evaluate(config.LifecycleConf{
+			Enabled:          true,
+			Strategy:         config.LifecycleStrategyCalendar,
+			MinKeep:          &minKeep,
+			MonthlyRetention: 1,
+			MonthlyDay:       15,
+		}, []backup.BackupMeta{
+			mockTypedBcp("march-14", 4, now, defs.StatusDone, defs.LogicalBackup),
+			mockTypedBcp("march-16", 2, now, defs.StatusDone, defs.LogicalBackup),
+		}, now)
+
+		if !reflect.DeepEqual(report.BackupsKept, []string{"march-16"}) {
+			t.Fatalf("BackupsKept = %v, want newest equal-distance candidate", report.BackupsKept)
+		}
+	})
+}
+
+func TestEvaluateOverlappingRetentionReasons(t *testing.T) {
+	now := time.Date(2026, time.March, 15, 12, 0, 0, 0, time.UTC)
+	minKeep := 0
+	report := Evaluate(config.LifecycleConf{
+		Enabled:          true,
+		Strategy:         config.LifecycleStrategyCalendar,
+		MinKeep:          &minKeep,
+		DailyRetention:   7,
+		WeeklyRetention:  1,
+		WeeklyDay:        int(now.Weekday()),
+		MonthlyRetention: 1,
+		MonthlyDay:       now.Day(),
+	}, []backup.BackupMeta{
+		mockTypedBcp("anchor", 0, now, defs.StatusDone, defs.LogicalBackup),
+	}, now)
+
+	want := []string{"Daily", "Weekly", "Monthly"}
+	if !reflect.DeepEqual(report.KeepReasons["anchor"], want) {
+		t.Fatalf("KeepReasons = %v, want %v", report.KeepReasons["anchor"], want)
+	}
+}
+
+func TestEvaluateExcludesSelectiveAndManagesExternal(t *testing.T) {
+	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+	minKeep := 0
+	selectiveA := mockTypedBcp("selective-a", 0, now, defs.StatusDone, defs.LogicalBackup)
+	selectiveA.Namespaces = []string{"db.a"}
+	selectiveB := mockTypedBcp("selective-b", 1, now, defs.StatusDone, defs.LogicalBackup)
+	selectiveB.Namespaces = []string{"db.b"}
+	failedSelective := mockTypedBcp("selective-failed", 20, now, defs.StatusError, defs.LogicalBackup)
+	failedSelective.Namespaces = []string{"db.failed"}
+	canceledSelective := mockTypedBcp("selective-canceled", 20, now, defs.StatusCancelled, defs.LogicalBackup)
+	canceledSelective.Namespaces = []string{"db.canceled"}
+	runningSelective := mockTypedBcp("selective-running", 0, now, defs.StatusRunning, defs.LogicalBackup)
+	runningSelective.Namespaces = []string{"db.running"}
+
+	report := Evaluate(config.LifecycleConf{
+		Enabled:         true,
+		PurgeFailed:     true,
+		MinKeep:         &minKeep,
+		WeeklyRetention: 1,
+	}, []backup.BackupMeta{
+		selectiveA,
+		selectiveB,
+		failedSelective,
+		canceledSelective,
+		runningSelective,
+		mockTypedBcp("full-logical", 2, now, defs.StatusDone, defs.LogicalBackup),
+		mockTypedBcp("expired-logical", 8, now, defs.StatusDone, defs.LogicalBackup),
+		mockTypedBcp("external", 2, now, defs.StatusDone, defs.ExternalBackup),
+		mockTypedBcp("expired-external", 8, now, defs.StatusDone, defs.ExternalBackup),
+	}, now)
+
+	for _, name := range []string{"selective-a", "selective-b", "selective-failed", "selective-canceled"} {
+		if !reflect.DeepEqual(report.KeepReasons[name], []string{selectiveBackupReason}) {
+			t.Errorf("%s reasons = %v, want selective exclusion", name, report.KeepReasons[name])
+		}
+	}
+	if !reflect.DeepEqual(report.KeepReasons["full-logical"], []string{"Weekly"}) {
+		t.Fatalf("full logical backup was displaced: %v", report.KeepReasons)
+	}
+	if !reflect.DeepEqual(report.KeepReasons["external"], []string{"Weekly"}) {
+		t.Fatalf("External backup should remain lifecycle-managed: %v", report.KeepReasons)
+	}
+	if !reflect.DeepEqual(report.BackupsPurged, []string{"expired-logical", "expired-external"}) {
+		t.Fatalf("BackupsPurged = %v, want expired managed backups", report.BackupsPurged)
+	}
+	if _, ok := report.BackupTypes["selective-running"]; ok {
+		t.Fatal("running selective backup appeared in lifecycle report")
+	}
+}
+
+func TestEvaluateProtectsBackupsCreatedAfterEvaluation(t *testing.T) {
+	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+	minKeep := 0
+	future := mockTypedBcp("future", -1, now, defs.StatusDone, defs.LogicalBackup)
+	report := Evaluate(config.LifecycleConf{
+		Enabled: true,
+		MinKeep: &minKeep,
+	}, []backup.BackupMeta{future}, now)
+
+	if !reflect.DeepEqual(report.KeepReasons["future"], []string{afterEvaluationReason}) {
+		t.Fatalf("future backup reasons = %v, want evaluation-time protection", report.KeepReasons["future"])
+	}
+	if len(report.DeleteTargets) != 0 {
+		t.Fatalf("future backup became a deletion target: %v", report.DeleteTargets)
+	}
+}
+
+func TestEvaluateExcludesInProgressStatuses(t *testing.T) {
+	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
+	minKeep := 0
+	report := Evaluate(config.LifecycleConf{
+		Enabled: true,
+		MinKeep: &minKeep,
+	}, []backup.BackupMeta{
+		mockTypedBcp("starting", 10, now, defs.StatusStarting, defs.LogicalBackup),
+		mockTypedBcp("running", 10, now, defs.StatusRunning, defs.LogicalBackup),
+		mockTypedBcp("dump-done", 10, now, defs.StatusDumpDone, defs.LogicalBackup),
+		mockTypedBcp("done", 10, now, defs.StatusDone, defs.LogicalBackup),
+	}, now)
+
+	if !reflect.DeepEqual(report.BackupsPurged, []string{"done"}) {
+		t.Fatalf("BackupsPurged = %v, want only completed backup", report.BackupsPurged)
+	}
+	for _, name := range []string{"starting", "running", "dump-done"} {
+		if _, ok := report.BackupTypes[name]; ok {
+			t.Errorf("in-progress backup %q appeared in lifecycle report", name)
+		}
 	}
 }
 

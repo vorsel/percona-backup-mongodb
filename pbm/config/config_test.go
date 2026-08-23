@@ -821,6 +821,10 @@ func TestLifecycleConfigPersistenceValidation(t *testing.T) {
 
 	persistedProfile, err := GetProfile(ctx, connClient, profileName)
 	require.NoError(t, err)
+	assert.Nil(t, persistedProfile.PITR)
+	assert.Nil(t, persistedProfile.Backup)
+	assert.Nil(t, persistedProfile.Restore)
+	require.NotNil(t, persistedProfile.Lifecycle)
 	assert.Equal(t, LifecycleStrategyRolling, persistedProfile.Lifecycle.GetStrategy())
 	assert.Equal(t, 5, persistedProfile.Lifecycle.DailyRetention)
 	assert.Zero(t, *persistedProfile.Lifecycle.MinKeep)
