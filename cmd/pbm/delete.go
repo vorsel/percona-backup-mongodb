@@ -382,8 +382,8 @@ func doLifecycleCleanup(
 
 	lifecycleAt := bson.Timestamp{T: uint32(time.Now().UTC().Unix())}
 	evaluationTime := time.Unix(int64(lifecycleAt.T), 0).UTC()
-	report, err := lifecycle.EvaluateProfile(
-		ctx, conn, d.profile.Value(), d.dryRun, evaluationTime,
+	report, err := lifecycle.BuildReport(
+		ctx, conn, d.profile.Value(), evaluationTime,
 	)
 	if err != nil {
 		return nil, err

@@ -20,7 +20,6 @@ import (
 )
 
 type Report struct {
-	DryRun        bool                 `json:"dryRun"`
 	ConfigUsed    config.LifecycleConf `json:"configUsed"`
 	Aborted       bool                 `json:"aborted"`
 	AbortReason   string               `json:"abortReason,omitempty"`
@@ -125,13 +124,12 @@ func filterBackupsByProfile(backups []backup.BackupMeta, profile string) []backu
 	return filtered
 }
 
-// EvaluateProfile loads lifecycle configuration and backup metadata for one
-// profile, then evaluates the policy at the provided time.
-func EvaluateProfile(
+// BuildReport loads lifecycle configuration and backup metadata for the main
+// storage or a named profile, then builds the report at the provided time.
+func BuildReport(
 	ctx context.Context,
 	conn connect.Client,
 	profile string,
-	dryRun bool,
 	now time.Time,
 ) (*Report, error) {
 	var cfg *config.Config
@@ -147,14 +145,13 @@ func EvaluateProfile(
 			return nil, errors.Wrap(err, "get profile config")
 		}
 	}
-
 	allBackups, err := backup.BackupsList(ctx, conn, 0)
 	if err != nil {
 		return nil, errors.Wrap(err, "fetch backups")
 	}
 
 	selectedBackups := filterBackupsByProfile(allBackups, profile)
-	report := evaluateRetentionPolicy(*cfg.Lifecycle, selectedBackups, allBackups, dryRun, now)
+	report := evaluateRetentionPolicy(*cfg.Lifecycle, selectedBackups, allBackups, now)
 
 	pitrEnabled, oplogOnly := cfg.PITR.Enabled, cfg.PITR.OplogOnly
 	if profile != "" {
@@ -578,10 +575,7 @@ func (r *Report) applyMinKeepGuard(backups []backup.BackupMeta) {
 		return
 	}
 
-	minKeep := 1
-	if r.ConfigUsed.MinKeep != nil {
-		minKeep = *r.ConfigUsed.MinKeep
-	}
+	minKeep := r.ConfigUsed.GetMinKeep()
 	if minKeep <= 0 {
 		return
 	}
@@ -601,36 +595,31 @@ func (r *Report) applyMinKeepGuard(backups []backup.BackupMeta) {
 }
 
 func (r *Report) String() string {
-	strategy := strings.ToLower(r.ConfigUsed.Strategy)
-	if strategy == "" {
-		strategy = "rolling" // Default
-	}
+	cfg := r.ConfigUsed
+	strategy := cfg.GetStrategy()
 
 	weeklyStr := "Auto (Newest in bucket)"
 	monthlyStr := "Auto (Newest in bucket)"
 
-	if strategy == "calendar" {
-		weeklyStr = fmt.Sprintf("Target Day: %d", r.ConfigUsed.WeeklyDay)
-		monthlyStr = fmt.Sprintf("Target Date: %d", r.ConfigUsed.MonthlyDay)
+	if strategy == config.LifecycleStrategyCalendar {
+		weeklyStr = fmt.Sprintf("Target Day: %d", cfg.WeeklyDay)
+		monthlyStr = fmt.Sprintf("Target Date: %d", cfg.MonthlyDay)
 	}
 
-	minKeep := 1
-	if r.ConfigUsed.MinKeep != nil {
-		minKeep = *r.ConfigUsed.MinKeep
-	}
+	minKeep := cfg.GetMinKeep()
 
-	res := fmt.Sprintf("Lifecycle Report (Dry Run: %v)\n", r.DryRun)
+	res := "Lifecycle Report\n"
 	res += fmt.Sprintf(
 		"Enabled: %v | Strategy: %s | Purge Failed: %v | Min Keep: %d\n",
-		r.ConfigUsed.Enabled,
+		cfg.Enabled,
 		strings.ToUpper(strategy),
-		r.ConfigUsed.PurgeFailed,
+		cfg.PurgeFailed,
 		minKeep,
 	)
 	res += fmt.Sprintf("Daily: %d | Weekly: %d [%s] | Monthly: %d [%s]\n\n",
-		r.ConfigUsed.DailyRetention,
-		r.ConfigUsed.WeeklyRetention, weeklyStr,
-		r.ConfigUsed.MonthlyRetention, monthlyStr)
+		cfg.DailyRetention,
+		cfg.WeeklyRetention, weeklyStr,
+		cfg.MonthlyRetention, monthlyStr)
 	if r.Aborted {
 		res += fmt.Sprintf("Status: ABORTED | Reason: %s\n\n", r.AbortReason)
 	}
@@ -656,8 +645,8 @@ func (r *Report) String() string {
 
 // Evaluate analyzes backups according to the lifecycle configuration and
 // returns a report describing which backups should be kept or purged.
-func Evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, dryRun bool, now time.Time) *Report {
-	report := evaluateRetentionPolicy(cfg, backups, backups, dryRun, now)
+func Evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, now time.Time) *Report {
+	report := evaluateRetentionPolicy(cfg, backups, backups, now)
 	report.applyMinKeepGuard(backups)
 	return report
 }
@@ -666,11 +655,9 @@ func evaluateRetentionPolicy(
 	cfg config.LifecycleConf,
 	selectedBackups []backup.BackupMeta,
 	allBackups []backup.BackupMeta,
-	dryRun bool,
 	now time.Time,
 ) *Report {
 	report := &Report{
-		DryRun:      dryRun,
 		ConfigUsed:  cfg,
 		KeepReasons: make(map[string][]string),
 		BackupTypes: make(map[string]string),
@@ -687,7 +674,7 @@ func evaluateRetentionPolicy(
 		return report
 	}
 
-	isCalendar := strings.ToLower(cfg.Strategy) == "calendar"
+	isCalendar := cfg.GetStrategy() == config.LifecycleStrategyCalendar
 
 	dailyCutoff := now.AddDate(0, 0, -cfg.DailyRetention)
 	weeklyCutoff := now.AddDate(0, 0, -(cfg.WeeklyRetention * 7))

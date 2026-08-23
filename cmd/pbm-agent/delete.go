@@ -330,7 +330,7 @@ func (a *Agent) cleanupLifecycle(
 	l log.LogEvent,
 ) {
 	lifecycleAt := time.Unix(int64(d.LifecycleAt.T), 0).UTC()
-	report, err := lifecycle.EvaluateProfile(ctx, a.leadConn, d.Profile, false, lifecycleAt)
+	report, err := lifecycle.BuildReport(ctx, a.leadConn, d.Profile, lifecycleAt)
 	if err != nil {
 		l.Error("evaluate lifecycle: %v", err)
 		return
