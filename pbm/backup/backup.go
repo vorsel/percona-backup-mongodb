@@ -182,6 +182,14 @@ func (b *Backup) Init(
 	return saveBackupMeta(ctx, b.leadConn, meta)
 }
 
+func (b *Backup) Finalize(
+	ctx context.Context,
+	bcp *ctrl.BackupCmd,
+	finishTime int64,
+) error {
+	return nil
+}
+
 // Run runs backup.
 // TODO: describe flow
 //
@@ -243,6 +251,11 @@ func (b *Backup) Run(ctx context.Context, bcp *ctrl.BackupCmd, opid ctrl.OPID, l
 			if inf.IsLeader() {
 				ferr := ChangeBackupState(b.leadConn, bcp.Name, status, err.Error())
 				l.Info("mark backup as %s `%v`: %v", status, err, ferr)
+
+				// set finish time in case of error/cancelled
+				if ferr = SetFinishTime(ctx, b.leadConn, bcp.Name, time.Now().Unix()); ferr != nil {
+					l.Info("set finish time: %v", err)
+				}
 			}
 		}
 
@@ -385,11 +398,11 @@ func (b *Backup) Run(ctx context.Context, bcp *ctrl.BackupCmd, opid ctrl.OPID, l
 		}
 
 		// PBM-1114: update file metadata with the same values as in database
-		unix := time.Now().Unix()
+		now := time.Now().Unix()
 		bcpm.Status = defs.StatusDone
-		bcpm.LastTransitionTS = unix
+		bcpm.LastTransitionTS = now
 		bcpm.Conditions = append(bcpm.Conditions, Condition{
-			Timestamp: unix,
+			Timestamp: now,
 			Status:    defs.StatusDone,
 		})
 
@@ -403,9 +416,14 @@ func (b *Backup) Run(ctx context.Context, bcp *ctrl.BackupCmd, opid ctrl.OPID, l
 			return errors.Wrap(err, "check backup files")
 		}
 
-		err = ChangeBackupStateWithUnixTime(ctx, b.leadConn, bcp.Name, defs.StatusDone, unix, "")
-		return errors.Wrapf(err, "check cluster for backup done: update backup meta with %s",
-			defs.StatusDone)
+		err = ChangeBackupStateWithUnixTime(ctx, b.leadConn, bcp.Name, defs.StatusDone, now, "")
+		if err != nil {
+			return errors.Wrapf(err, "check cluster for backup done: update backup meta with %s",
+				defs.StatusDone)
+		}
+
+		err = SetFinishTime(ctx, b.leadConn, bcp.Name, time.Now().Unix())
+		return errors.Wrap(err, "set finish time")
 	} else {
 		// to be sure the locks released only after the "done" status had written
 		err = b.waitForStatus(ctx, bcp.Name, defs.StatusDone, nil)

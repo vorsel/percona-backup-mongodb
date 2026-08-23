@@ -254,7 +254,6 @@ func (a *Agent) Backup(ctx context.Context, cmd *ctrl.BackupCmd, opid ctrl.OPID,
 
 	l.Info("backup started %s", util.LogProfileArg(cmd.Profile))
 	err = bcp.Run(bcpCtx, cmd, opid, l)
-	finishTime := time.Now().Unix()
 	if err != nil {
 		if errors.Is(err, storage.ErrCancelled) || errors.Is(err, context.Canceled) {
 			l.Info("backup was canceled")
@@ -266,8 +265,9 @@ func (a *Agent) Backup(ctx context.Context, cmd *ctrl.BackupCmd, opid ctrl.OPID,
 	}
 
 	if nodeInfo.IsLeader() {
-		if err := backup.SetFinishTime(ctx, a.leadConn, cmd.Name, finishTime); err != nil {
-			l.Error("set finish time: %v", err)
+		finishTime := backup.GetFinishTime(ctx, a.leadConn, cmd.Name)
+		if finishTime == 0 {
+			finishTime = time.Now().Unix()
 		}
 	}
 }

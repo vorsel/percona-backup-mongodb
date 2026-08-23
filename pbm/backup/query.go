@@ -188,6 +188,17 @@ func SetFinishTime(ctx context.Context, conn connect.Client, bcpName string, sec
 	return err
 }
 
+// GetFinishTime returns the time when the backup has ended.
+// Zero means it hasn't ended yet, or the meta couldn't be read.
+func GetFinishTime(ctx context.Context, conn connect.Client, bcpName string) int64 {
+	meta, err := getBackupMeta(ctx, conn, bson.D{{"name", bcpName}})
+	if err != nil {
+		return 0
+	}
+
+	return meta.FinishTime
+}
+
 func SetFirstWrite(ctx context.Context, conn connect.Client, bcpName string, first bson.Timestamp) error {
 	_, err := conn.BcpCollection().UpdateOne(
 		ctx,
