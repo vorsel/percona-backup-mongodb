@@ -403,6 +403,9 @@ type bcpDesc struct {
 	HSize              string          `json:"size_h" yaml:"size_h"`
 	HSizeUncompressed  string          `json:"size_uncompressed_h" yaml:"size_uncompressed_h"`
 	Err                *string         `json:"error,omitempty" yaml:"error,omitempty"`
+	StartTime          *string         `json:"start,omitempty" yaml:"start,omitempty"`
+	FinishTime         *string         `json:"finish,omitempty" yaml:"finish,omitempty"`
+	Duration           time.Duration   `json:"duration,omitempty" yaml:"duration,omitempty"`
 	Replsets           []bcpReplDesc   `json:"replsets" yaml:"replsets"`
 }
 
@@ -433,6 +436,29 @@ func (b *bcpDesc) String() string {
 	}
 
 	return string(data)
+}
+
+// setDurationInfo fills in when the backup has started and ended, and how long it took.
+func (b *bcpDesc) setDurationInfo(bcp *backup.BackupMeta) {
+	startTime := bcp.StartTime
+	if startTime > 0 {
+		b.StartTime = util.Ref(time.Unix(startTime, 0).UTC().Format(time.RFC3339))
+	} else {
+		// handling for backups <= v2.15
+		b.StartTime = &bcp.Name
+	}
+	finishTime := bcp.FinishTime
+	if finishTime == 0 && !bcp.Status.IsRunning() {
+		// handling for backups <= v2.15
+		finishTime = bcp.LastTransitionTS
+	}
+	if finishTime > 0 {
+		b.FinishTime = util.Ref(time.Unix(finishTime, 0).UTC().Format(time.RFC3339))
+	}
+	// check if backup is still running or the timestamps come from the different nodes with a skewed clock
+	if startTime > 0 && finishTime > startTime {
+		b.Duration = time.Duration(finishTime-startTime) * time.Second
+	}
 }
 
 func byteCountIEC(b int64) string {
@@ -505,6 +531,8 @@ func describeBackup(
 	if bcp.Err != "" {
 		rv.Err = &bcp.Err
 	}
+
+	rv.setDurationInfo(bcp)
 
 	rv.Replsets = make([]bcpReplDesc, len(bcp.Replsets))
 	for i, r := range bcp.Replsets {

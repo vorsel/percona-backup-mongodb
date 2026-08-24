@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/percona/percona-backup-mongodb/pbm/backup"
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
@@ -590,5 +591,138 @@ func BenchmarkBcpMatchCluster1000x1000Err(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		bcpsMatchCluster(bcps, "", "", shards, nil)
+	}
+}
+
+func TestSetDurationInfo(t *testing.T) {
+	// 1755000000: 2025-08-12T12:00:00Z
+	// 1755000150: 2025-08-12T12:02:30Z
+	// 1755000600: 2025-08-12T12:10:00Z
+	const (
+		startTS  = int64(1755000000)
+		finishTS = int64(1755000150)
+	)
+
+	testCases := []struct {
+		desc       string
+		meta       backup.BackupMeta
+		wantStart  string
+		wantFinish string
+		wantDur    time.Duration
+	}{
+		{
+			desc: "done backup",
+			meta: backup.BackupMeta{
+				Status:     defs.StatusDone,
+				StartTime:  startTS,
+				FinishTime: finishTS,
+			},
+			wantStart:  "2025-08-12T12:00:00Z",
+			wantFinish: "2025-08-12T12:02:30Z",
+			wantDur:    150 * time.Second,
+		},
+		{
+			desc: "failed backup",
+			meta: backup.BackupMeta{
+				Status:     defs.StatusError,
+				StartTime:  startTS,
+				FinishTime: finishTS,
+			},
+			wantStart:  "2025-08-12T12:00:00Z",
+			wantFinish: "2025-08-12T12:02:30Z",
+			wantDur:    150 * time.Second,
+		},
+		{
+			desc: "canceled backup",
+			meta: backup.BackupMeta{
+				Status:     defs.StatusCancelled,
+				StartTime:  startTS,
+				FinishTime: finishTS,
+			},
+			wantStart:  "2025-08-12T12:00:00Z",
+			wantFinish: "2025-08-12T12:02:30Z",
+			wantDur:    150 * time.Second,
+		},
+		{
+			desc: "running backup has no finish time nor duration",
+			meta: backup.BackupMeta{
+				Status:    defs.StatusRunning,
+				StartTime: startTS,
+			},
+			wantStart: "2025-08-12T12:00:00Z",
+		},
+		{
+			desc: "running backup doesn't fall back to the last transition",
+			meta: backup.BackupMeta{
+				Status:           defs.StatusRunning,
+				StartTime:        startTS,
+				LastTransitionTS: finishTS,
+			},
+			wantStart: "2025-08-12T12:00:00Z",
+		},
+		{
+			desc: "backup <= v2.15 falls back to the name and the last transition",
+			meta: backup.BackupMeta{
+				Name:             "2025-08-12T12:00:00Z",
+				Status:           defs.StatusDone,
+				LastTransitionTS: finishTS,
+			},
+			wantStart:  "2025-08-12T12:00:00Z",
+			wantFinish: "2025-08-12T12:02:30Z",
+		},
+		{
+			desc: "running backup <= v2.15 has no finish time",
+			meta: backup.BackupMeta{
+				Name:             "2025-08-12T12:00:00Z",
+				Status:           defs.StatusRunning,
+				LastTransitionTS: finishTS,
+			},
+			wantStart: "2025-08-12T12:00:00Z",
+		},
+		{
+			desc: "skewed clock gives no duration",
+			meta: backup.BackupMeta{
+				Status:     defs.StatusDone,
+				StartTime:  finishTS,
+				FinishTime: startTS,
+			},
+			wantStart:  "2025-08-12T12:02:30Z",
+			wantFinish: "2025-08-12T12:00:00Z",
+		},
+		{
+			desc: "sub-second backup gives no duration",
+			meta: backup.BackupMeta{
+				Status:     defs.StatusDone,
+				StartTime:  startTS,
+				FinishTime: startTS,
+			},
+			wantStart:  "2025-08-12T12:00:00Z",
+			wantFinish: "2025-08-12T12:00:00Z",
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.desc, func(t *testing.T) {
+			desc := &bcpDesc{}
+			desc.setDurationInfo(&tt.meta)
+
+			var start, finish string
+			if desc.StartTime != nil {
+				start = *desc.StartTime
+			}
+			if desc.FinishTime != nil {
+				finish = *desc.FinishTime
+			}
+
+			if start != tt.wantStart {
+				t.Errorf("start time: got %q, want %q", start, tt.wantStart)
+			}
+			if finish != tt.wantFinish {
+				t.Errorf("finish time: got %q, want %q", finish, tt.wantFinish)
+			}
+			if desc.Duration != tt.wantDur {
+				t.Errorf("duration: got %v, want %v", desc.Duration, tt.wantDur)
+			}
+		})
 	}
 }
