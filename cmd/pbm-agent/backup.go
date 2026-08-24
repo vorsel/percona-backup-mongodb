@@ -266,14 +266,13 @@ func (a *Agent) Backup(ctx context.Context, cmd *ctrl.BackupCmd, opid ctrl.OPID,
 
 	if nodeInfo.IsLeader() {
 		finishTime := backup.GetFinishTime(ctx, a.leadConn, cmd.Name)
-		if finishTime == 0 {
-			finishTime = time.Now().Unix()
-		}
 
 		start := time.Unix(startTime, 0).UTC()
 		finish := time.Unix(finishTime, 0).UTC()
-		l.Info("backup: %s, start: %v, finish: %v, duration: %v",
-			cmd.Name, start.Format(time.RFC3339), finish.Format(time.RFC3339), finish.Sub(start))
+		if finish.After(start) {
+			l.Info("backup: %s, start: %v, finish: %v, duration: %v",
+				cmd.Name, start.Format(time.RFC3339), finish.Format(time.RFC3339), finish.Sub(start))
+		}
 	}
 }
 

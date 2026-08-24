@@ -182,14 +182,6 @@ func (b *Backup) Init(
 	return saveBackupMeta(ctx, b.leadConn, meta)
 }
 
-func (b *Backup) Finalize(
-	ctx context.Context,
-	bcp *ctrl.BackupCmd,
-	finishTime int64,
-) error {
-	return nil
-}
-
 // Run runs backup.
 // TODO: describe flow
 //
@@ -252,9 +244,9 @@ func (b *Backup) Run(ctx context.Context, bcp *ctrl.BackupCmd, opid ctrl.OPID, l
 				ferr := ChangeBackupState(b.leadConn, bcp.Name, status, err.Error())
 				l.Info("mark backup as %s `%v`: %v", status, err, ferr)
 
-				// set finish time in case of error/cancelled
-				if ferr = SetFinishTime(ctx, b.leadConn, bcp.Name, time.Now().Unix()); ferr != nil {
-					l.Info("set finish time: %v", err)
+				// set finish time in case of error/canceled
+				if ferr = SetFinishTime(context.Background(), b.leadConn, bcp.Name, time.Now().Unix()); ferr != nil {
+					l.Info("set finish time: %v", ferr)
 				}
 			}
 		}
@@ -405,6 +397,7 @@ func (b *Backup) Run(ctx context.Context, bcp *ctrl.BackupCmd, opid ctrl.OPID, l
 			Timestamp: now,
 			Status:    defs.StatusDone,
 		})
+		bcpm.FinishTime = now
 
 		err = writeMeta(stg, bcpm)
 		if err != nil {
@@ -422,8 +415,11 @@ func (b *Backup) Run(ctx context.Context, bcp *ctrl.BackupCmd, opid ctrl.OPID, l
 				defs.StatusDone)
 		}
 
-		err = SetFinishTime(ctx, b.leadConn, bcp.Name, time.Now().Unix())
-		return errors.Wrap(err, "set finish time")
+		if err := SetFinishTime(ctx, b.leadConn, bcp.Name, now); err != nil {
+			// backup reached done status, so we'll not fail the whole backup in this case
+			l.Warning("set finish time: %v", err)
+		}
+		return nil
 	} else {
 		// to be sure the locks released only after the "done" status had written
 		err = b.waitForStatus(ctx, bcp.Name, defs.StatusDone, nil)
