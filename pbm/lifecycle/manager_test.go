@@ -1046,6 +1046,24 @@ func TestEvaluateMinKeepHardAbort(t *testing.T) {
 	}
 }
 
+func TestReportStringDescribesRollingSelection(t *testing.T) {
+	report := Report{ConfigUsed: config.LifecycleConf{
+		Enabled:          true,
+		Strategy:         config.LifecycleStrategyRolling,
+		WeeklyRetention:  3,
+		MonthlyRetention: 3,
+	}}
+
+	text := report.String()
+	if !strings.Contains(text, "Weekly: 3 [Newest in rolling bucket]") ||
+		!strings.Contains(text, "Monthly: 3 [Newest in rolling bucket]") {
+		t.Fatalf("rolling report does not describe bucket selection:\n%s", text)
+	}
+	if strings.Contains(text, "Auto (Newest in bucket)") {
+		t.Fatalf("rolling report contains ambiguous automatic-selection text:\n%s", text)
+	}
+}
+
 func TestEvaluateMinKeepThresholdAndDisable(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	backups := []backup.BackupMeta{

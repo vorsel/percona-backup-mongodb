@@ -604,8 +604,8 @@ func (r *Report) String() string {
 	cfg := r.ConfigUsed
 	strategy := cfg.GetStrategy()
 
-	weeklyStr := "Auto (Newest in bucket)"
-	monthlyStr := "Auto (Newest in bucket)"
+	weeklyStr := "Newest in rolling bucket"
+	monthlyStr := "Newest in rolling bucket"
 
 	if strategy == config.LifecycleStrategyCalendar {
 		weeklyStr = fmt.Sprintf("Target Day: %d", cfg.WeeklyDay)
