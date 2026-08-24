@@ -524,8 +524,8 @@ func (s storageStat) String() string {
 		}
 
 		duration := "-"
-		if ss.Duration > 0 {
-			duration = ss.Duration.String()
+		if ss.Duration != "" {
+			duration = ss.Duration
 		}
 
 		ret += fmt.Sprintf("  %-24s  %-10s  %-12s  %-20s  %-5s  %-4s  %-19s  %-10s  %s\n",

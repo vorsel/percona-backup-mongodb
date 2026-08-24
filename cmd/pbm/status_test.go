@@ -3,7 +3,6 @@ package main
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
 )
@@ -21,7 +20,7 @@ func TestStorageStatSnapshotDuration(t *testing.T) {
 				Status:    defs.StatusDone,
 				Type:      defs.LogicalBackup,
 				RestoreTS: restoreTS,
-				Duration:  150 * time.Second,
+				Duration:  "2m30s",
 			},
 			{
 				Name:      "2025-08-12T12:10:00Z",

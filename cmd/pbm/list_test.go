@@ -4,7 +4,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
@@ -120,7 +119,7 @@ func TestBackupListOutDuration(t *testing.T) {
 				Status:    defs.StatusDone,
 				Type:      defs.LogicalBackup,
 				RestoreTS: restoreTS,
-				Duration:  150 * time.Second,
+				Duration:  "2m30s",
 			},
 			{
 				Name:      "2025-08-12T13:00:00Z",

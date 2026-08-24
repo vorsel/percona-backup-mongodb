@@ -5,7 +5,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/percona/percona-backup-mongodb/pbm/backup"
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
@@ -608,7 +607,7 @@ func TestSetDurationInfo(t *testing.T) {
 		meta       backup.BackupMeta
 		wantStart  string
 		wantFinish string
-		wantDur    time.Duration
+		wantDur    string
 	}{
 		{
 			desc: "done backup",
@@ -619,7 +618,7 @@ func TestSetDurationInfo(t *testing.T) {
 			},
 			wantStart:  "2025-08-12T12:00:00Z",
 			wantFinish: "2025-08-12T12:02:30Z",
-			wantDur:    150 * time.Second,
+			wantDur:    "2m30s",
 		},
 		{
 			desc: "failed backup",
@@ -630,7 +629,7 @@ func TestSetDurationInfo(t *testing.T) {
 			},
 			wantStart:  "2025-08-12T12:00:00Z",
 			wantFinish: "2025-08-12T12:02:30Z",
-			wantDur:    150 * time.Second,
+			wantDur:    "2m30s",
 		},
 		{
 			desc: "canceled backup",
@@ -641,7 +640,7 @@ func TestSetDurationInfo(t *testing.T) {
 			},
 			wantStart:  "2025-08-12T12:00:00Z",
 			wantFinish: "2025-08-12T12:02:30Z",
-			wantDur:    150 * time.Second,
+			wantDur:    "2m30s",
 		},
 		{
 			desc: "running backup has no finish time nor duration",
@@ -669,7 +668,7 @@ func TestSetDurationInfo(t *testing.T) {
 			},
 			wantStart:  "2025-08-12T12:00:00Z",
 			wantFinish: "2025-08-12T12:02:30Z",
-			wantDur:    150 * time.Second,
+			wantDur:    "2m30s",
 		},
 		{
 			desc: "running backup <= v2.15 has no finish time nor duration",
@@ -690,7 +689,7 @@ func TestSetDurationInfo(t *testing.T) {
 			},
 			wantStart:  "2025-08-12T12:00:00Z",
 			wantFinish: "2025-08-12T12:02:30Z",
-			wantDur:    150 * time.Second,
+			wantDur:    "2m30s",
 		},
 		{
 			desc: "backup without any start timestamp has no start time nor duration",

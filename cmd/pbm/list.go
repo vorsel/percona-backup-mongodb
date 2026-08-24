@@ -233,8 +233,8 @@ func (bl backupListOut) String() string {
 		}
 
 		duration := "-"
-		if b.Duration > 0 {
-			duration = b.Duration.String()
+		if b.Duration != "" {
+			duration = b.Duration
 		}
 
 		s += fmt.Sprintf("  %-24s  %-12s  %-20s  %-10s  %-6s  %-19s  %s\n",

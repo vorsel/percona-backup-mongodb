@@ -405,7 +405,7 @@ type bcpDesc struct {
 	Err                *string         `json:"error,omitempty" yaml:"error,omitempty"`
 	StartTime          *string         `json:"start,omitempty" yaml:"start,omitempty"`
 	FinishTime         *string         `json:"finish,omitempty" yaml:"finish,omitempty"`
-	Duration           time.Duration   `json:"duration,omitempty" yaml:"duration,omitempty"`
+	Duration           string          `json:"duration,omitempty" yaml:"duration,omitempty"`
 	Replsets           []bcpReplDesc   `json:"replsets" yaml:"replsets"`
 }
 
@@ -468,15 +468,19 @@ func bcpFinishTime(bcp *backup.BackupMeta) int64 {
 	return bcp.FinishTime
 }
 
-// bcpDuration returns how long the backup took, or zero duration if it cannot be told.
-func bcpDuration(bcp *backup.BackupMeta) time.Duration {
+// bcpDuration renders how long the backup took,
+// or an empty string if it cannot be told.
+func bcpDuration(bcp *backup.BackupMeta) string {
 	startTime := bcpStartTime(bcp)
 	finishTime := bcpFinishTime(bcp)
+
 	// check if backup is still running or the timestamps come from the different nodes with a skewed clock
-	if startTime > 0 && finishTime > startTime {
-		return time.Duration(finishTime-startTime) * time.Second
+	if startTime <= 0 || finishTime <= startTime {
+		return ""
 	}
-	return 0
+
+	d := time.Duration(finishTime-startTime) * time.Second
+	return d.String()
 }
 
 func byteCountIEC(b int64) string {
