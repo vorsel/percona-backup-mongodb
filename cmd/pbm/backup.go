@@ -440,25 +440,43 @@ func (b *bcpDesc) String() string {
 
 // setDurationInfo fills in when the backup has started and ended, and how long it took.
 func (b *bcpDesc) setDurationInfo(bcp *backup.BackupMeta) {
-	startTime := bcp.StartTime
-	if startTime > 0 {
+	if startTime := bcpStartTime(bcp); startTime > 0 {
 		b.StartTime = util.Ref(time.Unix(startTime, 0).UTC().Format(time.RFC3339))
-	} else {
-		// handling for backups <= v2.15
-		b.StartTime = &bcp.Name
 	}
-	finishTime := bcp.FinishTime
-	if finishTime == 0 && !bcp.Status.IsRunning() {
-		// handling for backups <= v2.15
-		finishTime = bcp.LastTransitionTS
-	}
-	if finishTime > 0 {
+	if finishTime := bcpFinishTime(bcp); finishTime > 0 {
 		b.FinishTime = util.Ref(time.Unix(finishTime, 0).UTC().Format(time.RFC3339))
 	}
+	b.Duration = bcpDuration(bcp)
+}
+
+// bcpStartTime returns the time when the backup has started.
+func bcpStartTime(bcp *backup.BackupMeta) int64 {
+	if bcp.StartTime == 0 {
+		// handling for backups <= v2.15
+		return bcp.StartTS
+	}
+	return bcp.StartTime
+}
+
+// bcpFinishTime returns the time when the backup has ended,
+// or zero in case the backup is still running.
+func bcpFinishTime(bcp *backup.BackupMeta) int64 {
+	if bcp.FinishTime == 0 && !bcp.Status.IsRunning() {
+		// handling for backups <= v2.15
+		return bcp.LastTransitionTS
+	}
+	return bcp.FinishTime
+}
+
+// bcpDuration returns how long the backup took, or zero duration if it cannot be told.
+func bcpDuration(bcp *backup.BackupMeta) time.Duration {
+	startTime := bcpStartTime(bcp)
+	finishTime := bcpFinishTime(bcp)
 	// check if backup is still running or the timestamps come from the different nodes with a skewed clock
 	if startTime > 0 && finishTime > startTime {
-		b.Duration = time.Duration(finishTime-startTime) * time.Second
+		return time.Duration(finishTime-startTime) * time.Second
 	}
+	return 0
 }
 
 func byteCountIEC(b int64) string {

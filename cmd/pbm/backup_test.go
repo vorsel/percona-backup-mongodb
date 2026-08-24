@@ -661,23 +661,44 @@ func TestSetDurationInfo(t *testing.T) {
 			wantStart: "2025-08-12T12:00:00Z",
 		},
 		{
-			desc: "backup <= v2.15 falls back to the name and the last transition",
+			desc: "backup <= v2.15 falls back to the start ts and the last transition",
 			meta: backup.BackupMeta{
-				Name:             "2025-08-12T12:00:00Z",
 				Status:           defs.StatusDone,
+				StartTS:          startTS,
 				LastTransitionTS: finishTS,
 			},
 			wantStart:  "2025-08-12T12:00:00Z",
 			wantFinish: "2025-08-12T12:02:30Z",
+			wantDur:    150 * time.Second,
 		},
 		{
-			desc: "running backup <= v2.15 has no finish time",
+			desc: "running backup <= v2.15 has no finish time nor duration",
 			meta: backup.BackupMeta{
-				Name:             "2025-08-12T12:00:00Z",
 				Status:           defs.StatusRunning,
+				StartTS:          startTS,
 				LastTransitionTS: finishTS,
 			},
 			wantStart: "2025-08-12T12:00:00Z",
+		},
+		{
+			desc: "the start ts is used only as a fallback",
+			meta: backup.BackupMeta{
+				Status:     defs.StatusDone,
+				StartTime:  startTS,
+				StartTS:    startTS + 60,
+				FinishTime: finishTS,
+			},
+			wantStart:  "2025-08-12T12:00:00Z",
+			wantFinish: "2025-08-12T12:02:30Z",
+			wantDur:    150 * time.Second,
+		},
+		{
+			desc: "backup without any start timestamp has no start time nor duration",
+			meta: backup.BackupMeta{
+				Status:           defs.StatusDone,
+				LastTransitionTS: finishTS,
+			},
+			wantFinish: "2025-08-12T12:02:30Z",
 		},
 		{
 			desc: "skewed clock gives no duration",
