@@ -36,7 +36,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/minio v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/mongodb v0.42.0
 	go.mongodb.org/mongo-driver/v2 v2.6.0
-	golang.org/x/mod v0.37.0
+	golang.org/x/mod v0.40.0
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.22.0
 	google.golang.org/api v0.274.0
