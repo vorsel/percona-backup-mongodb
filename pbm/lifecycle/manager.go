@@ -51,10 +51,8 @@ type pitrBaseCandidates struct {
 }
 
 func (r *Report) addKeepReason(name, reason string) {
-	for _, existing := range r.KeepReasons[name] {
-		if existing == reason {
-			return
-		}
+	if slices.Contains(r.KeepReasons[name], reason) {
+		return
 	}
 	r.KeepReasons[name] = append(r.KeepReasons[name], reason)
 }
@@ -647,14 +645,6 @@ func (r *Report) String() string {
 		res += fmt.Sprintf("  - %s <%s>\n", b, bType)
 	}
 	return res
-}
-
-// Evaluate analyzes backups according to the lifecycle configuration and
-// returns a report describing which backups should be kept or purged.
-func Evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, now time.Time) *Report {
-	report := evaluateRetentionPolicy(cfg, backups, backups, now)
-	report.applyMinKeepGuard(backups)
-	return report
 }
 
 func evaluateRetentionPolicy(

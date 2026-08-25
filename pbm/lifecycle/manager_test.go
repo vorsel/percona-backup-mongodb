@@ -18,6 +18,12 @@ import (
 	storagefs "github.com/percona/percona-backup-mongodb/pbm/storage/fs"
 )
 
+func evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, now time.Time) *Report {
+	report := evaluateRetentionPolicy(cfg, backups, backups, now)
+	report.applyMinKeepGuard(backups)
+	return report
+}
+
 // mockBcp is a helper to generate fake backups.
 // daysAgo subtracts from the baseTime (our frozen mockNow).
 func mockBcp(name string, daysAgo int, baseTime time.Time, status defs.Status) backup.BackupMeta {
@@ -299,7 +305,7 @@ func TestEvaluate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			report := Evaluate(tt.cfg, tt.backups, tt.mockNow)
+			report := evaluate(tt.cfg, tt.backups, tt.mockNow)
 
 			if report.Aborted {
 				t.Errorf("unexpected aborted plan: %s", report.AbortReason)
@@ -330,7 +336,7 @@ func TestEvaluateRollingBucketBoundaries(t *testing.T) {
 	minKeep := 0
 
 	t.Run("weekly", func(t *testing.T) {
-		report := Evaluate(config.LifecycleConf{
+		report := evaluate(config.LifecycleConf{
 			Enabled:         true,
 			MinKeep:         &minKeep,
 			WeeklyRetention: 2,
@@ -351,7 +357,7 @@ func TestEvaluateRollingBucketBoundaries(t *testing.T) {
 	})
 
 	t.Run("monthly", func(t *testing.T) {
-		report := Evaluate(config.LifecycleConf{
+		report := evaluate(config.LifecycleConf{
 			Enabled:          true,
 			MinKeep:          &minKeep,
 			MonthlyRetention: 2,
@@ -377,7 +383,7 @@ func TestEvaluateCalendarBucketsIncludeCurrentPeriod(t *testing.T) {
 
 	t.Run("weekly", func(t *testing.T) {
 		now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC) // Wednesday
-		report := Evaluate(config.LifecycleConf{
+		report := evaluate(config.LifecycleConf{
 			Enabled:         true,
 			Strategy:        config.LifecycleStrategyCalendar,
 			MinKeep:         &minKeep,
@@ -398,7 +404,7 @@ func TestEvaluateCalendarBucketsIncludeCurrentPeriod(t *testing.T) {
 
 	t.Run("monthly", func(t *testing.T) {
 		now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
-		report := Evaluate(config.LifecycleConf{
+		report := evaluate(config.LifecycleConf{
 			Enabled:          true,
 			Strategy:         config.LifecycleStrategyCalendar,
 			MinKeep:          &minKeep,
@@ -417,7 +423,7 @@ func TestEvaluateCalendarBucketsIncludeCurrentPeriod(t *testing.T) {
 
 	t.Run("sunday target", func(t *testing.T) {
 		now := time.Date(2026, time.March, 22, 12, 0, 0, 0, time.UTC) // Sunday
-		report := Evaluate(config.LifecycleConf{
+		report := evaluate(config.LifecycleConf{
 			Enabled:         true,
 			Strategy:        config.LifecycleStrategyCalendar,
 			MinKeep:         &minKeep,
@@ -435,7 +441,7 @@ func TestEvaluateCalendarBucketsIncludeCurrentPeriod(t *testing.T) {
 
 	t.Run("equal distance prefers newest", func(t *testing.T) {
 		now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
-		report := Evaluate(config.LifecycleConf{
+		report := evaluate(config.LifecycleConf{
 			Enabled:          true,
 			Strategy:         config.LifecycleStrategyCalendar,
 			MinKeep:          &minKeep,
@@ -455,7 +461,7 @@ func TestEvaluateCalendarBucketsIncludeCurrentPeriod(t *testing.T) {
 func TestEvaluateOverlappingRetentionReasons(t *testing.T) {
 	now := time.Date(2026, time.March, 15, 12, 0, 0, 0, time.UTC)
 	minKeep := 0
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled:          true,
 		Strategy:         config.LifecycleStrategyCalendar,
 		MinKeep:          &minKeep,
@@ -488,7 +494,7 @@ func TestEvaluateExcludesSelectiveAndManagesExternal(t *testing.T) {
 	runningSelective := mockTypedBcp("selective-running", 0, now, defs.StatusRunning, defs.LogicalBackup)
 	runningSelective.Namespaces = []string{"db.running"}
 
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled:         true,
 		PurgeFailed:     true,
 		MinKeep:         &minKeep,
@@ -530,7 +536,7 @@ func TestEvaluateProtectsBackupsCreatedAfterEvaluation(t *testing.T) {
 	sameSecond := mockTypedBcp("same-second", 0, now, defs.StatusDone, defs.LogicalBackup)
 	sameSecond.StartTS = now.Unix()
 	future := mockTypedBcp("future", -1, now, defs.StatusDone, defs.LogicalBackup)
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
 	}, []backup.BackupMeta{sameSecond, future}, now)
@@ -548,7 +554,7 @@ func TestEvaluateProtectsBackupsCreatedAfterEvaluation(t *testing.T) {
 func TestEvaluateExcludesInProgressStatuses(t *testing.T) {
 	now := time.Date(2026, time.March, 18, 12, 0, 0, 0, time.UTC)
 	minKeep := 0
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
 	}, []backup.BackupMeta{
@@ -571,7 +577,7 @@ func TestEvaluateExcludesInProgressStatuses(t *testing.T) {
 func TestEvaluateRetainsCompleteIncrementalChain(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	minKeep := 0
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled:        true,
 		DailyRetention: 3,
 		MinKeep:        &minKeep,
@@ -604,7 +610,7 @@ func TestEvaluateRetainsCompleteIncrementalChain(t *testing.T) {
 func TestEvaluateRetainedBaseKeepsNewerIncrements(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	minKeep := 0
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled:         true,
 		Strategy:        "rolling",
 		WeeklyRetention: 6,
@@ -637,7 +643,7 @@ func TestEvaluateRetainedBaseKeepsNewerIncrements(t *testing.T) {
 func TestEvaluatePurgesIncrementalChainThroughRoot(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	minKeep := 0
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled:     true,
 		PurgeFailed: true,
 		MinKeep:     &minKeep,
@@ -673,7 +679,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 			withLastWrite(mockTypedBcp("latest", 10, now, defs.StatusDone, defs.LogicalBackup), 300),
 			withLastWrite(mockTypedBcp("older", 20, now, defs.StatusDone, defs.LogicalBackup), 200),
 		}
-		report := Evaluate(cfg, backups, now)
+		report := evaluate(cfg, backups, now)
 
 		candidates, err := report.findPITRBaseCandidates(backups)
 		if err != nil {
@@ -710,7 +716,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 			withLastWrite(mockTypedBcp("survivor", 0, now, defs.StatusDone, defs.LogicalBackup), 400),
 			withLastWrite(mockTypedBcp("candidate", 10, now, defs.StatusDone, defs.LogicalBackup), 300),
 		}
-		report := Evaluate(cfg, backups, now)
+		report := evaluate(cfg, backups, now)
 
 		candidates, err := report.findPITRBaseCandidates(backups)
 		if err != nil {
@@ -734,7 +740,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 			withLastWrite(mockIncrementalBcp("inc-1", "base", 20, now, defs.StatusDone), 300),
 			withLastWrite(mockIncrementalBcp("base", "", 30, now, defs.StatusDone), 200),
 		}
-		report := Evaluate(cfg, backups, now)
+		report := evaluate(cfg, backups, now)
 
 		candidates, err := report.findPITRBaseCandidates(backups)
 		if err != nil {
@@ -777,7 +783,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 			withLastWrite(mockIncrementalBcp("inc-1", "base", 20, now, defs.StatusDone), 150),
 			withLastWrite(mockIncrementalBcp("base", "", 30, now, defs.StatusDone), 100),
 		}
-		report := Evaluate(cfg, backups, now)
+		report := evaluate(cfg, backups, now)
 
 		candidates, err := report.findPITRBaseCandidates(backups)
 		if err != nil {
@@ -807,7 +813,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 			withLastWrite(mockTypedBcp("standalone", 20, now, defs.StatusDone, defs.LogicalBackup), 200),
 			withLastWrite(mockIncrementalBcp("base", "", 30, now, defs.StatusDone), 100),
 		}
-		report := Evaluate(cfg, backups, now)
+		report := evaluate(cfg, backups, now)
 
 		candidates, err := report.findPITRBaseCandidates(backups)
 		if err != nil {
@@ -828,7 +834,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 			withLastWrite(mockTypedBcp("zeta", 10, now, defs.StatusDone, defs.LogicalBackup), 300),
 			withLastWrite(mockTypedBcp("alpha", 20, now, defs.StatusDone, defs.LogicalBackup), 300),
 		}
-		report := Evaluate(cfg, backups, now)
+		report := evaluate(cfg, backups, now)
 
 		candidates, err := report.findPITRBaseCandidates(backups)
 		if err != nil {
@@ -870,7 +876,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 			selective,
 			withLastWrite(mockTypedBcp("external", 30, now, defs.StatusDone, defs.ExternalBackup), 600),
 		}
-		report := Evaluate(cfg, backups, now)
+		report := evaluate(cfg, backups, now)
 
 		candidates, err := report.findPITRBaseCandidates(backups)
 		if err != nil {
@@ -885,7 +891,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 		backups := []backup.BackupMeta{
 			withLastWrite(mockTypedBcp("candidate", 10, now, defs.StatusDone, defs.LogicalBackup), 300),
 		}
-		report := Evaluate(cfg, backups, now)
+		report := evaluate(cfg, backups, now)
 
 		candidates, err := report.findPITRBaseCandidates(backups)
 		if err != nil {
@@ -911,7 +917,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 			withLastWrite(mockTypedBcp("survivor", 0, now, defs.StatusDone, defs.LogicalBackup), 100),
 			withLastWrite(mockTypedBcp("candidate", 10, now, defs.StatusDone, defs.LogicalBackup), 300),
 		}
-		report := Evaluate(cfg, backups, now)
+		report := evaluate(cfg, backups, now)
 
 		candidates, err := report.findPITRBaseCandidates(backups)
 		if err != nil {
@@ -945,7 +951,7 @@ func TestSortDeleteTargetsByRestoreTime(t *testing.T) {
 		withLastWrite(mockTypedBcp("new", 30, now, defs.StatusDone, defs.LogicalBackup), 300),
 		withLastWrite(mockIncrementalBcp("base", "", 40, now, defs.StatusDone), 150),
 	}
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
 	}, backups, now)
@@ -962,7 +968,7 @@ func TestEvaluateProtectedIncrementRetainsChain(t *testing.T) {
 	minKeep := 0
 
 	t.Run("failed attempt", func(t *testing.T) {
-		report := Evaluate(config.LifecycleConf{
+		report := evaluate(config.LifecycleConf{
 			Enabled: true,
 			MinKeep: &minKeep,
 		}, []backup.BackupMeta{
@@ -986,7 +992,7 @@ func TestEvaluateProtectedIncrementRetainsChain(t *testing.T) {
 		}
 		backups[0].Store.Filesystem.Path = "/other-backups"
 		backups[0].PBMVersion = "2.15.0"
-		report := Evaluate(config.LifecycleConf{
+		report := evaluate(config.LifecycleConf{
 			Enabled:     true,
 			PurgeFailed: true,
 			MinKeep:     &minKeep,
@@ -1020,7 +1026,7 @@ func TestEvaluateMinKeepHardAbort(t *testing.T) {
 		mockTypedBcp("expired", 10, now, defs.StatusDone, defs.LogicalBackup),
 	}
 
-	report := Evaluate(cfg, backups, now)
+	report := evaluate(cfg, backups, now)
 	if !report.Aborted {
 		t.Fatal("expected minKeep abort")
 	}
@@ -1039,7 +1045,7 @@ func TestEvaluateMinKeepHardAbort(t *testing.T) {
 		t.Fatal("minKeep must not rescue expired backups")
 	}
 
-	text := Evaluate(cfg, backups, now).String()
+	text := evaluate(cfg, backups, now).String()
 	if !strings.Contains(text, "Status: ABORTED") ||
 		!strings.Contains(text, "Proposed backups to PURGE (not executed)") {
 		t.Fatalf("aborted report is not explicit:\n%s", text)
@@ -1073,7 +1079,7 @@ func TestEvaluateMinKeepThresholdAndDisable(t *testing.T) {
 	}
 
 	minKeep := 2
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled:        true,
 		DailyRetention: 2,
 		MinKeep:        &minKeep,
@@ -1084,7 +1090,7 @@ func TestEvaluateMinKeepThresholdAndDisable(t *testing.T) {
 	}
 
 	minKeep = 1
-	report = Evaluate(config.LifecycleConf{
+	report = evaluate(config.LifecycleConf{
 		Enabled:        true,
 		DailyRetention: 2,
 		MinKeep:        &minKeep,
@@ -1095,7 +1101,7 @@ func TestEvaluateMinKeepThresholdAndDisable(t *testing.T) {
 	}
 
 	minKeep = 0
-	report = Evaluate(config.LifecycleConf{
+	report = evaluate(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
 	}, backups, now)
@@ -1109,7 +1115,7 @@ func TestEvaluateMinKeepGuardRequiresDeletionTargets(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	minKeep := 1
 
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
 	}, []backup.BackupMeta{
@@ -1120,7 +1126,7 @@ func TestEvaluateMinKeepGuardRequiresDeletionTargets(t *testing.T) {
 		t.Fatalf("plan without deletion targets should not be aborted: %+v", report)
 	}
 
-	report = Evaluate(config.LifecycleConf{
+	report = evaluate(config.LifecycleConf{
 		Enabled:     true,
 		PurgeFailed: true,
 		MinKeep:     &minKeep,
@@ -1144,7 +1150,7 @@ func TestEvaluateMinKeepCountsOnlyCompleteSuccessfulRestorePoints(t *testing.T) 
 	minKeep := 2
 	selective := mockTypedBcp("selective", 0, now, defs.StatusDone, defs.LogicalBackup)
 	selective.Namespaces = []string{"db.collection"}
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled:        true,
 		DailyRetention: 1,
 		MinKeep:        &minKeep,
@@ -1171,7 +1177,7 @@ func TestEvaluateMinKeepCountsOnlyCompleteSuccessfulRestorePoints(t *testing.T) 
 func TestEvaluateMinKeepCountsSuccessfulIncrementalRestorePoints(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	minKeep := 2
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled:        true,
 		DailyRetention: 1,
 		MinKeep:        &minKeep,
@@ -1195,7 +1201,7 @@ func TestEvaluateMinKeepCountsSuccessfulIncrementalRestorePoints(t *testing.T) {
 func TestEvaluateMinKeepExcludesInvalidIncrementalChains(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	minKeep := 1
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
 	}, []backup.BackupMeta{
@@ -1340,7 +1346,7 @@ func TestEvaluateProtectsInvalidIncrementalChain(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			report := Evaluate(config.LifecycleConf{
+			report := evaluate(config.LifecycleConf{
 				Enabled:        true,
 				DailyRetention: 3,
 				MinKeep:        &minKeep,
@@ -1419,7 +1425,7 @@ func TestEvaluateProtectsSuccessfulChainSplitAcrossStorageLocations(t *testing.T
 	}
 	backups[0].Store.Filesystem.Path = "/other-backups"
 
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled: true,
 		MinKeep: &minKeep,
 	}, backups, now)
@@ -1447,7 +1453,7 @@ func TestEvaluateAllowsFailedAttemptAfterStorageChange(t *testing.T) {
 	}
 	backups[0].Store.Filesystem.Path = "/other-backups"
 
-	report := Evaluate(config.LifecycleConf{
+	report := evaluate(config.LifecycleConf{
 		Enabled:     true,
 		PurgeFailed: true,
 		MinKeep:     &minKeep,
@@ -1467,7 +1473,7 @@ func TestEvaluateAllowsFailedAttemptAfterStorageChange(t *testing.T) {
 
 func TestEvaluateDisabledIncrementalChain(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
-	report := Evaluate(config.LifecycleConf{}, []backup.BackupMeta{
+	report := evaluate(config.LifecycleConf{}, []backup.BackupMeta{
 		mockIncrementalBcp("inc-1", "base", 10, now, defs.StatusDone),
 		mockIncrementalBcp("base", "", 30, now, defs.StatusDone),
 	}, now)
