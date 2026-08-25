@@ -482,9 +482,9 @@ func (s storageStat) String() string {
 		return a.RestoreTS > b.RestoreTS
 	})
 
-	ret += fmt.Sprintf("  %-24s  %-10s  %-12s  %-20s  %-5s  %-4s  %-19s  %s\n",
-		"NAME", "SIZE", "TYPE", "PROFILE", "SEL", "BASE", "RESTORE TIME", "STATUS")
-	ret += fmt.Sprintf("  %s\n", strings.Repeat("-", 24+10+12+20+5+4+19+6+(7*2)))
+	ret += fmt.Sprintf("  %-24s  %-10s  %-12s  %-20s  %-5s  %-4s  %-19s  %-10s  %s\n",
+		"NAME", "SIZE", "TYPE", "PROFILE", "SEL", "BASE", "RESTORE TIME", "DURATION", "STATUS")
+	ret += fmt.Sprintf("  %s\n", strings.Repeat("-", 24+10+12+20+5+4+19+10+6+(8*2)))
 
 	for i := range s.Snapshot {
 		ss := &s.Snapshot[i]
@@ -523,7 +523,12 @@ func (s storageStat) String() string {
 			status = strings.TrimRight(status[:maxStatusLen-3], " ") + "..."
 		}
 
-		ret += fmt.Sprintf("  %-24s  %-10s  %-12s  %-20s  %-5s  %-4s  %-19s  %s\n",
+		duration := "-"
+		if ss.Duration != "" {
+			duration = ss.Duration
+		}
+
+		ret += fmt.Sprintf("  %-24s  %-10s  %-12s  %-20s  %-5s  %-4s  %-19s  %-10s  %s\n",
 			ss.Name,
 			storage.PrettySize(ss.Size),
 			bcpType,
@@ -531,6 +536,7 @@ func (s storageStat) String() string {
 			selective,
 			base,
 			fmtTS(ss.RestoreTS),
+			duration,
 			status)
 	}
 
@@ -611,6 +617,7 @@ func getStorageStat(
 			Size:       bcp.Size,
 			Status:     bcp.Status,
 			RestoreTS:  bcp.LastTransitionTS,
+			Duration:   bcpDuration(&bcp),
 			PBMVersion: bcp.PBMVersion,
 			Type:       bcp.Type,
 			SrcBackup:  bcp.SrcBackup,

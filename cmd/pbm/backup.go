@@ -403,6 +403,9 @@ type bcpDesc struct {
 	HSize              string          `json:"size_h" yaml:"size_h"`
 	HSizeUncompressed  string          `json:"size_uncompressed_h" yaml:"size_uncompressed_h"`
 	Err                *string         `json:"error,omitempty" yaml:"error,omitempty"`
+	StartTime          *string         `json:"start,omitempty" yaml:"start,omitempty"`
+	FinishTime         *string         `json:"finish,omitempty" yaml:"finish,omitempty"`
+	Duration           string          `json:"duration,omitempty" yaml:"duration,omitempty"`
 	Replsets           []bcpReplDesc   `json:"replsets" yaml:"replsets"`
 }
 
@@ -433,6 +436,51 @@ func (b *bcpDesc) String() string {
 	}
 
 	return string(data)
+}
+
+// setDurationInfo fills in when the backup has started and ended, and how long it took.
+func (b *bcpDesc) setDurationInfo(bcp *backup.BackupMeta) {
+	if startTime := bcpStartTime(bcp); startTime > 0 {
+		b.StartTime = util.Ref(time.Unix(startTime, 0).UTC().Format(time.RFC3339))
+	}
+	if finishTime := bcpFinishTime(bcp); finishTime > 0 {
+		b.FinishTime = util.Ref(time.Unix(finishTime, 0).UTC().Format(time.RFC3339))
+	}
+	b.Duration = bcpDuration(bcp)
+}
+
+// bcpStartTime returns the time when the backup has started.
+func bcpStartTime(bcp *backup.BackupMeta) int64 {
+	if bcp.StartTime == 0 {
+		// handling for backups <= v2.15
+		return bcp.StartTS
+	}
+	return bcp.StartTime
+}
+
+// bcpFinishTime returns the time when the backup has ended,
+// or zero in case the backup is still running.
+func bcpFinishTime(bcp *backup.BackupMeta) int64 {
+	if bcp.FinishTime == 0 && !bcp.Status.IsRunning() {
+		// handling for backups <= v2.15
+		return bcp.LastTransitionTS
+	}
+	return bcp.FinishTime
+}
+
+// bcpDuration renders how long the backup took,
+// or an empty string if it cannot be told.
+func bcpDuration(bcp *backup.BackupMeta) string {
+	startTime := bcpStartTime(bcp)
+	finishTime := bcpFinishTime(bcp)
+
+	// check if backup is still running or the timestamps come from the different nodes with a skewed clock
+	if startTime <= 0 || finishTime <= startTime {
+		return ""
+	}
+
+	d := time.Duration(finishTime-startTime) * time.Second
+	return d.String()
 }
 
 func byteCountIEC(b int64) string {
@@ -505,6 +553,8 @@ func describeBackup(
 	if bcp.Err != "" {
 		rv.Err = &bcp.Err
 	}
+
+	rv.setDurationInfo(bcp)
 
 	rv.Replsets = make([]bcpReplDesc, len(bcp.Replsets))
 	for i, r := range bcp.Replsets {

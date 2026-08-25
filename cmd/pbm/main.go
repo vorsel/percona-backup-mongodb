@@ -1221,6 +1221,7 @@ type snapshotStat struct {
 	Err         error            `json:"-"`
 	ErrString   string           `json:"error,omitempty"`
 	RestoreTS   int64            `json:"restoreTo"`
+	Duration    string           `json:"duration,omitempty"`
 	PBMVersion  string           `json:"pbmVersion"`
 	Type        defs.BackupType  `json:"type"`
 	SrcBackup   string           `json:"src"`
