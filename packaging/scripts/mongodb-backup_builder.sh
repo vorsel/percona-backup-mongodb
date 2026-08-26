@@ -202,7 +202,7 @@ install_deps() {
             INSTALL_LIST="git wget jq"
         fi
         yum -y install ${INSTALL_LIST}
-        yum -y install rpm-build make rpmlint rpmdevtools golang krb5-devel
+        yum -y install rpm-build make rpmlint rpmdevtools golang krb5-devel systemd-rpm-macros
         install_golang
     else
         until apt-get update; do
