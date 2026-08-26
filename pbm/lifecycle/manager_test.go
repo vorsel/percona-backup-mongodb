@@ -19,7 +19,7 @@ import (
 )
 
 func evaluate(cfg config.LifecycleConf, backups []backup.BackupMeta, now time.Time) *Report {
-	report := evaluateRetentionPolicy(cfg, backups, backups, now)
+	report := evaluateRetentionPolicy(cfg, backups, now)
 	report.applyMinKeepGuard(backups)
 	return report
 }
@@ -458,6 +458,96 @@ func TestEvaluateCalendarBucketsIncludeCurrentPeriod(t *testing.T) {
 	})
 }
 
+func TestBetterCandidate(t *testing.T) {
+	current := backup.BackupMeta{
+		Name:        "current",
+		StartTS:     100,
+		LastWriteTS: bson.Timestamp{T: 200, I: 1},
+	}
+	tests := []struct {
+		name      string
+		candidate backup.BackupMeta
+		current   *backup.BackupMeta
+		want      bool
+	}{
+		{
+			name:      "nil current",
+			candidate: backup.BackupMeta{},
+			want:      true,
+		},
+		{
+			name: "newer restore time",
+			candidate: backup.BackupMeta{
+				StartTS:     99,
+				LastWriteTS: bson.Timestamp{T: 201},
+			},
+			current: &current,
+			want:    true,
+		},
+		{
+			name: "older restore time",
+			candidate: backup.BackupMeta{
+				StartTS:     101,
+				LastWriteTS: bson.Timestamp{T: 199},
+			},
+			current: &current,
+		},
+		{
+			name: "newer restore increment",
+			candidate: backup.BackupMeta{
+				StartTS:     99,
+				LastWriteTS: bson.Timestamp{T: 200, I: 2},
+			},
+			current: &current,
+			want:    true,
+		},
+		{
+			name: "equal restore time newer start",
+			candidate: backup.BackupMeta{
+				StartTS:     101,
+				LastWriteTS: current.LastWriteTS,
+			},
+			current: &current,
+			want:    true,
+		},
+		{
+			name: "equal restore time older start",
+			candidate: backup.BackupMeta{
+				StartTS:     99,
+				LastWriteTS: current.LastWriteTS,
+			},
+			current: &current,
+		},
+		{
+			name: "equal times smaller name",
+			candidate: backup.BackupMeta{
+				Name:        "alpha",
+				StartTS:     current.StartTS,
+				LastWriteTS: current.LastWriteTS,
+			},
+			current: &current,
+			want:    true,
+		},
+		{
+			name: "equal times larger name",
+			candidate: backup.BackupMeta{
+				Name:        "zeta",
+				StartTS:     current.StartTS,
+				LastWriteTS: current.LastWriteTS,
+			},
+			current: &current,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := betterCandidate(&tt.candidate, tt.current); got != tt.want {
+				t.Fatalf("betterCandidate() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestEvaluateOverlappingRetentionReasons(t *testing.T) {
 	now := time.Date(2026, time.March, 15, 12, 0, 0, 0, time.UTC)
 	minKeep := 0
@@ -695,7 +785,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 150, End: 400}}) {
 			t.Fatal("candidate should be required for PITR")
 		}
-		report.protectPITRAnchors(candidates.anchors, backups, backups)
+		report.protectPITRAnchors(candidates.anchors, backups)
 
 		if !reflect.DeepEqual(report.BackupsKept, []string{"survivor", "latest"}) {
 			t.Fatalf("BackupsKept = %v, want survivor and latest", report.BackupsKept)
@@ -756,7 +846,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 350, End: 500}}) {
 			t.Fatal("incremental chain should be required for PITR")
 		}
-		report.protectPITRAnchors(candidates.anchors, backups, backups)
+		report.protectPITRAnchors(candidates.anchors, backups)
 
 		wantKept := []string{"survivor", "inc-2", "inc-1", "base"}
 		if !reflect.DeepEqual(report.BackupsKept, wantKept) {
@@ -796,7 +886,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 100, End: 300}}) {
 			t.Fatal("purged chain members cannot replace the surviving PITR base")
 		}
-		report.protectPITRAnchors(candidates.anchors, backups, backups)
+		report.protectPITRAnchors(candidates.anchors, backups)
 
 		if !reflect.DeepEqual(report.BackupsPurged, []string{"standalone"}) {
 			t.Fatalf("BackupsPurged = %v, want standalone", report.BackupsPurged)
@@ -852,7 +942,7 @@ func TestPITRBaseCandidates(t *testing.T) {
 		if !isRequiredPITRBase(candidates.previousRestoreTime, []oplog.Timeline{{Start: 150, End: 400}}) {
 			t.Fatal("tied candidates should be required for PITR")
 		}
-		report.protectPITRAnchors(candidates.anchors, backups, backups)
+		report.protectPITRAnchors(candidates.anchors, backups)
 
 		if len(report.BackupsPurged) != 0 || len(report.DeleteTargets) != 0 {
 			t.Fatalf("tied PITR bases remained purgeable: %+v", report)
@@ -985,13 +1075,11 @@ func TestEvaluateProtectedIncrementRetainsChain(t *testing.T) {
 		}
 	})
 
-	t.Run("running increment on different storage", func(t *testing.T) {
+	t.Run("running increment", func(t *testing.T) {
 		backups := []backup.BackupMeta{
 			mockIncrementalBcp("running", "base", 0, now, defs.StatusRunning),
 			mockIncrementalBcp("base", "", 30, now, defs.StatusDone),
 		}
-		backups[0].Store.Filesystem.Path = "/other-backups"
-		backups[0].PBMVersion = "2.15.0"
 		report := evaluate(config.LifecycleConf{
 			Enabled:     true,
 			PurgeFailed: true,
@@ -1223,37 +1311,6 @@ func TestEvaluateMinKeepExcludesInvalidIncrementalChains(t *testing.T) {
 	}
 }
 
-func TestEvaluateMinKeepCountsSplitChainBase(t *testing.T) {
-	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
-	minKeep := 2
-	cfg := config.LifecycleConf{
-		Enabled: true,
-		MinKeep: &minKeep,
-	}
-	allBackups := []backup.BackupMeta{
-		mockIncrementalBcp("archive-inc", "inc-1", 1, now, defs.StatusDone),
-		mockIncrementalBcp("inc-1", "base", 5, now, defs.StatusDone),
-		mockIncrementalBcp("base", "", 10, now, defs.StatusDone),
-		mockTypedBcp("standalone", 20, now, defs.StatusDone, defs.LogicalBackup),
-	}
-	allBackups[0].Store.Name = "archive"
-	allBackups[0].Store.IsProfile = true
-	selectedBackups := filterBackupsByProfile(allBackups, "")
-
-	report := evaluateRetentionPolicy(cfg, selectedBackups, allBackups, now)
-	report.applyMinKeepGuard(selectedBackups)
-
-	if report.Aborted {
-		t.Fatalf("complete prefix of split chain should satisfy minKeep: %+v", report)
-	}
-	if !reflect.DeepEqual(report.BackupsKept, []string{"inc-1", "base"}) {
-		t.Fatalf("BackupsKept = %v, want independently restorable chain prefix", report.BackupsKept)
-	}
-	if !reflect.DeepEqual(report.DeleteTargets, []string{"standalone"}) {
-		t.Fatalf("DeleteTargets = %v, want standalone", report.DeleteTargets)
-	}
-}
-
 func TestMinKeepCountsPITRProtectedRestorePoint(t *testing.T) {
 	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	minKeep := 2
@@ -1268,8 +1325,8 @@ func TestMinKeepCountsPITRProtectedRestorePoint(t *testing.T) {
 		mockTypedBcp("expired", 20, now, defs.StatusDone, defs.LogicalBackup),
 	}
 
-	report := evaluateRetentionPolicy(cfg, backups, backups, now)
-	report.protectPITRAnchors([]string{"pitr-base"}, backups, backups)
+	report := evaluateRetentionPolicy(cfg, backups, now)
+	report.protectPITRAnchors([]string{"pitr-base"}, backups)
 	report.applyMinKeepGuard(backups)
 
 	if report.Aborted {
@@ -1300,7 +1357,7 @@ func TestMinKeepIsScopedToSelectedProfile(t *testing.T) {
 	allBackups[2].Store.IsProfile = true
 	selectedBackups := filterBackupsByProfile(allBackups, "")
 
-	report := evaluateRetentionPolicy(cfg, selectedBackups, allBackups, now)
+	report := evaluateRetentionPolicy(cfg, selectedBackups, now)
 	report.applyMinKeepGuard(selectedBackups)
 
 	if !report.Aborted {
@@ -1364,83 +1421,6 @@ func TestEvaluateProtectsInvalidIncrementalChain(t *testing.T) {
 				t.Fatalf("DeleteTargets = %v, want none", report.DeleteTargets)
 			}
 		})
-	}
-}
-
-func TestEvaluateProtectsChainSplitAcrossProfiles(t *testing.T) {
-	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
-	minKeep := 0
-	allBackups := []backup.BackupMeta{
-		mockIncrementalBcp("archive-inc", "base", 10, now, defs.StatusDone),
-		mockIncrementalBcp("base", "", 30, now, defs.StatusDone),
-	}
-	allBackups[0].Store.Name = "archive"
-	allBackups[0].Store.IsProfile = true
-	mainBackups := filterBackupsByProfile(allBackups, "")
-	report := evaluateRetentionPolicy(config.LifecycleConf{
-		Enabled: true,
-		MinKeep: &minKeep,
-	}, mainBackups, allBackups, now)
-
-	if !reflect.DeepEqual(report.BackupsKept, []string{"base"}) {
-		t.Fatalf("BackupsKept = %v, want base", report.BackupsKept)
-	}
-	if !reflect.DeepEqual(report.KeepReasons["base"], []string{invalidIncrementalChainReason}) {
-		t.Errorf("base reasons = %v, want %q", report.KeepReasons["base"], invalidIncrementalChainReason)
-	}
-	if len(report.DeleteTargets) != 0 {
-		t.Fatalf("DeleteTargets = %v, want none", report.DeleteTargets)
-	}
-
-	archiveBackups := filterBackupsByProfile(allBackups, "archive")
-	archiveReport := evaluateRetentionPolicy(config.LifecycleConf{
-		Enabled: true,
-		MinKeep: &minKeep,
-	}, archiveBackups, allBackups, now)
-
-	if !reflect.DeepEqual(archiveReport.BackupsKept, []string{"archive-inc"}) {
-		t.Fatalf("archive BackupsKept = %v, want archive-inc", archiveReport.BackupsKept)
-	}
-	if !reflect.DeepEqual(
-		archiveReport.KeepReasons["archive-inc"],
-		[]string{invalidIncrementalChainReason},
-	) {
-		t.Errorf(
-			"archive-inc reasons = %v, want %q",
-			archiveReport.KeepReasons["archive-inc"],
-			invalidIncrementalChainReason,
-		)
-	}
-	if len(archiveReport.DeleteTargets) != 0 {
-		t.Fatalf("archive DeleteTargets = %v, want none", archiveReport.DeleteTargets)
-	}
-}
-
-func TestEvaluateProtectsSuccessfulChainSplitAcrossStorageLocations(t *testing.T) {
-	now := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
-	minKeep := 0
-	backups := []backup.BackupMeta{
-		mockIncrementalBcp("inc-1", "base", 10, now, defs.StatusDone),
-		mockIncrementalBcp("base", "", 30, now, defs.StatusDone),
-	}
-	backups[0].Store.Filesystem.Path = "/other-backups"
-
-	report := evaluate(config.LifecycleConf{
-		Enabled: true,
-		MinKeep: &minKeep,
-	}, backups, now)
-
-	wantKept := []string{"inc-1", "base"}
-	if !reflect.DeepEqual(report.BackupsKept, wantKept) {
-		t.Fatalf("BackupsKept = %v, want %v", report.BackupsKept, wantKept)
-	}
-	for _, name := range wantKept {
-		if !reflect.DeepEqual(report.KeepReasons[name], []string{invalidIncrementalChainReason}) {
-			t.Errorf("%s reasons = %v, want %q", name, report.KeepReasons[name], invalidIncrementalChainReason)
-		}
-	}
-	if len(report.DeleteTargets) != 0 {
-		t.Fatalf("DeleteTargets = %v, want none", report.DeleteTargets)
 	}
 }
 

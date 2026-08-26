@@ -39,11 +39,6 @@ const (
 	selectiveBackupReason         = "Selective Backup (Excluded)"
 )
 
-type incrementalChain struct {
-	members   []backup.BackupMeta
-	deletable bool
-}
-
 type pitrBaseCandidates struct {
 	anchors             []string
 	previousRestoreTime bson.Timestamp
@@ -79,14 +74,19 @@ func (r *Report) countKeptSuccessfulRestorePoints(backups []backup.BackupMeta) i
 }
 
 // isCompleteIncrementalRestorePoint verifies that a candidate and all of its
-// selected-profile ancestors form a completed path on the base storage.
+// ancestors form a completed path to the base backup.
 func isCompleteIncrementalRestorePoint(
 	bcp backup.BackupMeta,
 	byName map[string]backup.BackupMeta,
 ) bool {
-	path := []backup.BackupMeta{bcp}
 	seen := make(map[string]struct{})
-	for bcp.SrcBackup != "" {
+	for {
+		if bcp.Status != defs.StatusDone {
+			return false
+		}
+		if bcp.SrcBackup == "" {
+			return true
+		}
 		if _, ok := seen[bcp.Name]; ok {
 			return false
 		}
@@ -96,18 +96,8 @@ func isCompleteIncrementalRestorePoint(
 		if !ok {
 			return false
 		}
-		path = append(path, parent)
 		bcp = parent
 	}
-
-	base := bcp
-	for _, member := range path {
-		if member.Status != defs.StatusDone ||
-			!member.Store.IsSameStorage(&base.Store.StorageConf) {
-			return false
-		}
-	}
-	return true
 }
 
 func filterBackupsByProfile(backups []backup.BackupMeta, profile string) []backup.BackupMeta {
@@ -153,7 +143,7 @@ func BuildReport(
 	}
 
 	selectedBackups := filterBackupsByProfile(allBackups, profile)
-	report := evaluateRetentionPolicy(*cfg.Lifecycle, selectedBackups, allBackups, now)
+	report := evaluateRetentionPolicy(*cfg.Lifecycle, selectedBackups, now)
 
 	var pitrEnabled, oplogOnly bool
 	if profile == "" {
@@ -166,13 +156,13 @@ func BuildReport(
 	}
 
 	if pitrEnabled && !oplogOnly && len(report.DeleteTargets) != 0 {
-		err = report.applyPITRDeleteChecks(ctx, conn, selectedBackups, allBackups)
+		err = report.applyPITRDeleteChecks(ctx, conn, selectedBackups)
 		if err != nil {
 			return nil, errors.Wrap(err, "apply PITR deletion checks")
 		}
 
 		if profile == "" && len(report.DeleteTargets) != 0 {
-			err = report.applyPITRProtection(ctx, conn, selectedBackups, allBackups)
+			err = report.applyPITRProtection(ctx, conn, selectedBackups)
 			if err != nil {
 				return nil, errors.Wrap(err, "apply PITR protection")
 			}
@@ -182,60 +172,6 @@ func BuildReport(
 	report.applyMinKeepGuard(selectedBackups)
 	report.sortDeleteTargets(selectedBackups)
 	return report, nil
-}
-
-// buildIncrementalChains groups incremental metadata by its resolved base and
-// marks chains unsafe when they cross profiles or data-owning storage boundaries.
-func buildIncrementalChains(
-	allBackups []backup.BackupMeta,
-	selectedNames map[string]struct{},
-) []incrementalChain {
-	byName := make(map[string]backup.BackupMeta, len(allBackups))
-	for _, bcp := range allBackups {
-		if bcp.Type != defs.IncrementalBackup {
-			continue
-		}
-		byName[bcp.Name] = bcp
-	}
-
-	byBase := make(map[string][]backup.BackupMeta)
-	var bases []string
-	var invalid []incrementalChain
-	for _, bcp := range allBackups {
-		if bcp.Type != defs.IncrementalBackup {
-			continue
-		}
-
-		base, ok := findIncrementalBase(bcp, byName)
-		if !ok {
-			invalid = append(invalid, incrementalChain{members: []backup.BackupMeta{bcp}})
-			continue
-		}
-		if _, ok := byBase[base.Name]; !ok {
-			bases = append(bases, base.Name)
-		}
-		byBase[base.Name] = append(byBase[base.Name], bcp)
-	}
-
-	chains := make([]incrementalChain, 0, len(bases)+len(invalid))
-	for _, baseName := range bases {
-		base := byName[baseName]
-		chain := incrementalChain{members: byBase[baseName], deletable: true}
-		for _, member := range chain.members {
-			if _, ok := selectedNames[member.Name]; !ok {
-				chain.deletable = false
-				break
-			}
-			if member.Status == defs.StatusDone &&
-				!member.Store.IsSameStorage(&base.Store.StorageConf) {
-				chain.deletable = false
-				break
-			}
-		}
-		chains = append(chains, chain)
-	}
-
-	return append(chains, invalid...)
 }
 
 // findIncrementalBase follows source links to the base. Unresolvable links fail
@@ -262,26 +198,34 @@ func findIncrementalBase(
 }
 
 // applyIncrementalChainRules expands keep decisions to complete incremental
-// chains and protects chains that cannot be deleted within the selected profile.
-func (r *Report) applyIncrementalChainRules(selectedBackups, allBackups []backup.BackupMeta) {
-	selectedNames := make(map[string]struct{}, len(selectedBackups))
-	for _, bcp := range selectedBackups {
-		selectedNames[bcp.Name] = struct{}{}
+// chains within the selected storage and protects invalid chain metadata.
+func (r *Report) applyIncrementalChainRules(backups []backup.BackupMeta) {
+	byName := make(map[string]backup.BackupMeta, len(backups))
+	for _, bcp := range backups {
+		if bcp.Type == defs.IncrementalBackup {
+			byName[bcp.Name] = bcp
+		}
 	}
 
-	chains := buildIncrementalChains(allBackups, selectedNames)
-	for _, chain := range chains {
-		if !chain.deletable {
-			for _, member := range chain.members {
-				if _, ok := selectedNames[member.Name]; ok && !member.Status.IsRunning() {
-					r.addKeepReason(member.Name, invalidIncrementalChainReason)
-				}
-			}
+	byBase := make(map[string][]backup.BackupMeta)
+	for _, bcp := range backups {
+		if bcp.Type != defs.IncrementalBackup {
 			continue
 		}
 
+		base, ok := findIncrementalBase(bcp, byName)
+		if !ok {
+			if !bcp.Status.IsRunning() {
+				r.addKeepReason(bcp.Name, invalidIncrementalChainReason)
+			}
+			continue
+		}
+		byBase[base.Name] = append(byBase[base.Name], bcp)
+	}
+
+	for _, chain := range byBase {
 		retain := false
-		for _, member := range chain.members {
+		for _, member := range chain {
 			if len(r.KeepReasons[member.Name]) > 0 || member.Status.IsRunning() {
 				retain = true
 				break
@@ -291,11 +235,8 @@ func (r *Report) applyIncrementalChainRules(selectedBackups, allBackups []backup
 			continue
 		}
 
-		for _, member := range chain.members {
-			if _, ok := selectedNames[member.Name]; !ok || member.Status.IsRunning() {
-				continue
-			}
-			if len(r.KeepReasons[member.Name]) == 0 {
+		for _, member := range chain {
+			if !member.Status.IsRunning() && len(r.KeepReasons[member.Name]) == 0 {
 				r.addKeepReason(member.Name, incrementalChainReason)
 			}
 		}
@@ -316,10 +257,10 @@ func isMainPITRBaseSnapshot(bcp backup.BackupMeta) bool {
 func (r *Report) applyPITRDeleteChecks(
 	ctx context.Context,
 	conn connect.Client,
-	selectedBackups, allBackups []backup.BackupMeta,
+	backups []backup.BackupMeta,
 ) error {
-	byName := make(map[string]backup.BackupMeta, len(selectedBackups))
-	for _, bcp := range selectedBackups {
+	byName := make(map[string]backup.BackupMeta, len(backups))
+	for _, bcp := range backups {
 		byName[bcp.Name] = bcp
 	}
 
@@ -367,7 +308,7 @@ func (r *Report) applyPITRDeleteChecks(
 		anchors = append(anchors, name)
 	}
 	slices.Sort(anchors)
-	r.protectPITRAnchors(anchors, selectedBackups, allBackups)
+	r.protectPITRAnchors(anchors, backups)
 	return nil
 }
 
@@ -376,9 +317,9 @@ func (r *Report) applyPITRDeleteChecks(
 func (r *Report) applyPITRProtection(
 	ctx context.Context,
 	conn connect.Client,
-	selectedBackups, allBackups []backup.BackupMeta,
+	backups []backup.BackupMeta,
 ) error {
-	candidates, err := r.findPITRBaseCandidates(selectedBackups)
+	candidates, err := r.findPITRBaseCandidates(backups)
 	if err != nil || len(candidates.anchors) == 0 {
 		return err
 	}
@@ -396,20 +337,20 @@ func (r *Report) applyPITRProtection(
 		return nil
 	}
 
-	r.protectPITRAnchors(candidates.anchors, selectedBackups, allBackups)
+	r.protectPITRAnchors(candidates.anchors, backups)
 	return nil
 }
 
 func (r *Report) protectPITRAnchors(
 	anchorNames []string,
-	selectedBackups, allBackups []backup.BackupMeta,
+	backups []backup.BackupMeta,
 ) {
 	for _, name := range anchorNames {
 		r.addKeepReason(name, pitrBaseSnapshotReason)
 	}
 	// A protected incremental base retains its complete deletion unit.
-	r.applyIncrementalChainRules(selectedBackups, allBackups)
-	r.buildBackupLists(selectedBackups)
+	r.applyIncrementalChainRules(backups)
+	r.buildBackupLists(backups)
 }
 
 func (r *Report) findPITRBaseCandidates(backups []backup.BackupMeta) (pitrBaseCandidates, error) {
@@ -649,8 +590,7 @@ func (r *Report) String() string {
 
 func evaluateRetentionPolicy(
 	cfg config.LifecycleConf,
-	selectedBackups []backup.BackupMeta,
-	allBackups []backup.BackupMeta,
+	backups []backup.BackupMeta,
 	now time.Time,
 ) *Report {
 	now = now.UTC().Truncate(time.Second)
@@ -661,13 +601,13 @@ func evaluateRetentionPolicy(
 	}
 
 	if !cfg.Enabled {
-		for _, bcp := range selectedBackups {
+		for _, bcp := range backups {
 			if bcp.Status.IsRunning() {
 				continue
 			}
 			report.addKeepReason(bcp.Name, "Lifecycle Disabled")
 		}
-		report.buildBackupLists(selectedBackups)
+		report.buildBackupLists(backups)
 		return report
 	}
 
@@ -678,7 +618,7 @@ func evaluateRetentionPolicy(
 	weeklyCandidates := make(map[string][]backup.BackupMeta)
 	monthlyCandidates := make(map[string][]backup.BackupMeta)
 
-	for _, bcp := range selectedBackups {
+	for _, bcp := range backups {
 		if bcp.Status.IsRunning() {
 			continue
 		}
@@ -748,8 +688,8 @@ func evaluateRetentionPolicy(
 	}
 
 	// Apply mandatory chain retention before materializing policy projections.
-	report.applyIncrementalChainRules(selectedBackups, allBackups)
-	report.buildBackupLists(selectedBackups)
+	report.applyIncrementalChainRules(backups)
+	report.buildBackupLists(backups)
 
 	return report
 }
@@ -838,7 +778,14 @@ func dateDistance(a, b time.Time) int {
 }
 
 func betterCandidate(candidate, current *backup.BackupMeta) bool {
-	return current == nil ||
-		candidate.StartTS > current.StartTS ||
-		candidate.StartTS == current.StartTS && candidate.Name < current.Name
+	switch {
+	case current == nil:
+		return true
+	case candidate.LastWriteTS != current.LastWriteTS:
+		return candidate.LastWriteTS.After(current.LastWriteTS)
+	case candidate.StartTS != current.StartTS:
+		return candidate.StartTS > current.StartTS
+	default:
+		return candidate.Name < current.Name
+	}
 }
