@@ -74,10 +74,11 @@ type Config struct {
 	Name      string `bson:"name,omitempty" json:"name,omitempty" yaml:"name,omitempty"`
 	IsProfile bool   `bson:"profile,omitempty" json:"profile,omitempty" yaml:"profile,omitempty"`
 
-	Storage StorageConf  `bson:"storage" json:"storage" yaml:"storage"`
-	PITR    *PITRConf    `bson:"pitr,omitempty" json:"pitr,omitempty" yaml:"pitr,omitempty"`
-	Backup  *BackupConf  `bson:"backup,omitempty" json:"backup,omitempty" yaml:"backup,omitempty"`
-	Restore *RestoreConf `bson:"restore,omitempty" json:"restore,omitempty" yaml:"restore,omitempty"`
+	Storage   StorageConf    `bson:"storage" json:"storage" yaml:"storage"`
+	PITR      *PITRConf      `bson:"pitr,omitempty" json:"pitr,omitempty" yaml:"pitr,omitempty"`
+	Backup    *BackupConf    `bson:"backup,omitempty" json:"backup,omitempty" yaml:"backup,omitempty"`
+	Restore   *RestoreConf   `bson:"restore,omitempty" json:"restore,omitempty" yaml:"restore,omitempty"`
+	Lifecycle *LifecycleConf `bson:"lifecycle,omitempty" json:"lifecycle,omitempty" yaml:"lifecycle,omitempty"`
 
 	Epoch bson.Timestamp `bson:"epoch" json:"-" yaml:"-"`
 }
@@ -95,6 +96,9 @@ func Parse(r io.Reader) (*Config, error) {
 	err = cfg.Storage.Cast()
 	if err != nil {
 		return nil, errors.Wrap(err, "storage cast")
+	}
+	if err := ValidateLifecycle(cfg.Lifecycle); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
@@ -114,6 +118,7 @@ func (c *Config) Clone() *Config {
 		Backup:    c.Backup.Clone(),
 		Epoch:     c.Epoch,
 	}
+	rv.Lifecycle = c.Lifecycle.Clone()
 
 	return rv
 }
@@ -605,6 +610,9 @@ func GetConfig(ctx context.Context, m connect.Client) (*Config, error) {
 	if cfg.Restore == nil {
 		cfg.Restore = &RestoreConf{}
 	}
+	if cfg.Lifecycle == nil {
+		cfg.Lifecycle = &LifecycleConf{}
+	}
 
 	if cfg.Backup.Compression == "" {
 		cfg.Backup.Compression = defs.DefaultCompression
@@ -627,6 +635,9 @@ func SetConfig(ctx context.Context, m connect.Client, cfg *Config) error {
 		return errors.Wrap(err, "cast storage")
 	}
 	sanitizeStoragePaths(&cfg.Storage)
+	if err := ValidateLifecycle(cfg.Lifecycle); err != nil {
+		return err
+	}
 
 	if cfg.PITR != nil {
 		if c := string(cfg.PITR.Compression); c != "" && !compress.IsValidCompressionType(c) {
@@ -663,7 +674,7 @@ func SetConfigVar(ctx context.Context, m connect.Client, key, val string) error 
 	}
 
 	// just check if config was set
-	_, err := GetConfig(ctx, m)
+	cfg, err := GetConfig(ctx, m)
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
 			return errors.New("config is not set")
@@ -697,6 +708,13 @@ func SetConfigVar(ctx context.Context, m connect.Client, key, val string) error 
 		return errors.Wrapf(err, "casting value of %s", key)
 	}
 
+	if isLifecycleKey(key) {
+		applyLifecycleConfigVar(cfg.Lifecycle, key, v)
+		if err := ValidateLifecycle(cfg.Lifecycle); err != nil {
+			return err
+		}
+	}
+
 	if isStoragePathKey(key) {
 		v = storage.TrimSlashes(v.(string))
 	}
@@ -727,6 +745,34 @@ func SetConfigVar(ctx context.Context, m connect.Client, key, val string) error 
 		bson.D{{"profile", nil}},
 		bson.M{"$set": bson.M{key: v}})
 	return errors.Wrap(err, "write to db")
+}
+
+func isLifecycleKey(key string) bool {
+	return strings.HasPrefix(key, "lifecycle.")
+}
+
+func applyLifecycleConfigVar(cfg *LifecycleConf, key string, value any) {
+	switch key {
+	case "lifecycle.enabled":
+		cfg.Enabled = value.(bool)
+	case "lifecycle.strategy":
+		cfg.Strategy = value.(string)
+	case "lifecycle.purgeFailed":
+		cfg.PurgeFailed = value.(bool)
+	case "lifecycle.minKeep":
+		minKeep := int(value.(int64))
+		cfg.MinKeep = &minKeep
+	case "lifecycle.dailyRetention":
+		cfg.DailyRetention = int(value.(int64))
+	case "lifecycle.weeklyRetention":
+		cfg.WeeklyRetention = int(value.(int64))
+	case "lifecycle.weeklyDay":
+		cfg.WeeklyDay = int(value.(int64))
+	case "lifecycle.monthlyRetention":
+		cfg.MonthlyRetention = int(value.(int64))
+	case "lifecycle.monthlyDay":
+		cfg.MonthlyDay = int(value.(int64))
+	}
 }
 
 // sanitizeStoragePaths trims leading/trailing slashes from bucket, container,

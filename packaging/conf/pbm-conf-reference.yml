@@ -301,6 +301,39 @@
 #  numParallelCollections:
 
 
+#=========================Lifecycle Configuration===========================
+
+## Configure GFS backup retention. Apply it with `pbm cleanup --lifecycle`.
+#lifecycle:
+#  enabled: false
+
+## Supported strategies are rolling (default) and calendar.
+#  strategy: rolling
+
+## Abort cleanup if fewer than this many successful restore points would remain.
+## Set to 0 to disable the safeguard.
+#  minKeep: 1
+
+## Allow lifecycle cleanup to purge failed and cancelled managed backups.
+#  purgeFailed: false
+
+## Keep every backup in the recent N-day window.
+#  dailyRetention: 0
+
+## Keep one backup per type in each of N weekly and monthly buckets, including
+## the current bucket. Rolling uses fixed 7-day and 30-day buckets.
+#  weeklyRetention: 0
+#  monthlyRetention: 0
+
+## Calendar targets. weeklyDay uses 0=Sunday through 6=Saturday. monthlyDay
+## uses 1 through 31; shorter months use their last day as the target.
+#  weeklyDay: 0
+#  monthlyDay: 1
+
+## Logical, physical, incremental, and external backups are managed in separate
+## lanes. Selective logical backups are excluded from lifecycle cleanup.
+
+
 #==========================Restore Configuration===========================
 
 ## Options to adjust the memory consumption in environments with tight memory bounds.

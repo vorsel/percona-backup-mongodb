@@ -30,6 +30,102 @@ import (
 	"github.com/percona/percona-backup-mongodb/pbm/storage/s3"
 )
 
+func TestLifecycleConfDefaultsAndClone(t *testing.T) {
+	cfg := &LifecycleConf{Strategy: "CALENDAR"}
+	require.Equal(t, LifecycleStrategyCalendar, cfg.GetStrategy())
+	require.Equal(t, DefaultLifecycleMinKeep, cfg.GetMinKeep())
+	require.Nil(t, cfg.MinKeep)
+
+	minKeep := DefaultLifecycleMinKeep
+	cfg.MinKeep = &minKeep
+	clone := cfg.Clone()
+	require.NotSame(t, cfg, clone)
+	require.NotSame(t, cfg.MinKeep, clone.MinKeep)
+	*clone.MinKeep = 0
+	assert.Equal(t, DefaultLifecycleMinKeep, *cfg.MinKeep)
+
+	minKeep = 0
+	cfg = &LifecycleConf{MinKeep: &minKeep}
+	assert.Zero(t, cfg.GetMinKeep())
+
+	clonedConfig := (&Config{Lifecycle: cfg}).Clone()
+	require.NotSame(t, cfg.MinKeep, clonedConfig.Lifecycle.MinKeep)
+}
+
+func TestValidateLifecycle(t *testing.T) {
+	negative := -1
+	tests := []struct {
+		name    string
+		cfg     LifecycleConf
+		wantErr string
+	}{
+		{name: "defaults"},
+		{name: "rolling", cfg: LifecycleConf{Strategy: LifecycleStrategyRolling}},
+		{
+			name: "calendar",
+			cfg: LifecycleConf{
+				Strategy:         LifecycleStrategyCalendar,
+				WeeklyRetention:  1,
+				WeeklyDay:        int(time.Saturday),
+				MonthlyRetention: 1,
+				MonthlyDay:       31,
+			},
+		},
+		{name: "unknown strategy", cfg: LifecycleConf{Strategy: "unknown"}, wantErr: "lifecycle.strategy"},
+		{name: "negative daily", cfg: LifecycleConf{DailyRetention: -1}, wantErr: "lifecycle.dailyRetention"},
+		{name: "negative weekly", cfg: LifecycleConf{WeeklyRetention: -1}, wantErr: "lifecycle.weeklyRetention"},
+		{name: "negative monthly", cfg: LifecycleConf{MonthlyRetention: -1}, wantErr: "lifecycle.monthlyRetention"},
+		{name: "negative minKeep", cfg: LifecycleConf{MinKeep: &negative}, wantErr: "lifecycle.minKeep"},
+		{
+			name: "invalid weekly day",
+			cfg: LifecycleConf{
+				Strategy:        LifecycleStrategyCalendar,
+				WeeklyRetention: 1,
+				WeeklyDay:       7,
+			},
+			wantErr: "lifecycle.weeklyDay",
+		},
+		{
+			name: "invalid monthly day",
+			cfg: LifecycleConf{
+				Strategy:         LifecycleStrategyCalendar,
+				MonthlyRetention: 1,
+			},
+			wantErr: "lifecycle.monthlyDay",
+		},
+		{
+			name: "rolling ignores target days",
+			cfg: LifecycleConf{
+				Strategy:         LifecycleStrategyRolling,
+				WeeklyRetention:  1,
+				WeeklyDay:        7,
+				MonthlyRetention: 1,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateLifecycle(&tt.cfg)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestParseValidatesLifecycle(t *testing.T) {
+	_, err := Parse(strings.NewReader(`
+storage:
+  type: blackhole
+lifecycle:
+  strategy: unknown
+`))
+	require.ErrorContains(t, err, "lifecycle.strategy")
+}
+
 func TestIsSameStorage(t *testing.T) {
 	t.Run("S3", func(t *testing.T) {
 		cfg := &s3.Config{
@@ -665,6 +761,73 @@ func TestS3DebugLogLevelValidation(t *testing.T) {
 	got, err := GetConfigVar(ctx, connClient, "storage.s3.debugLogLevels")
 	require.NoError(t, err)
 	assert.Equal(t, "Signing", got)
+}
+
+func TestLifecycleConfigPersistenceValidation(t *testing.T) {
+	ctx := context.Background()
+	minKeep := 0
+	cfg := &Config{
+		Storage: StorageConf{Type: storage.Blackhole},
+		Lifecycle: &LifecycleConf{
+			Enabled:        true,
+			Strategy:       "ROLLING",
+			MinKeep:        &minKeep,
+			DailyRetention: 7,
+		},
+	}
+	require.NoError(t, SetConfig(ctx, connClient, cfg))
+	assert.Equal(t, "ROLLING", cfg.Lifecycle.Strategy)
+
+	invalid := cfg.Clone()
+	invalid.Lifecycle.DailyRetention = -1
+	require.ErrorContains(t, SetConfig(ctx, connClient, invalid), "lifecycle.dailyRetention")
+
+	persisted, err := GetConfig(ctx, connClient)
+	require.NoError(t, err)
+	assert.Equal(t, 7, persisted.Lifecycle.DailyRetention)
+	assert.Zero(t, *persisted.Lifecycle.MinKeep)
+
+	require.NoError(t, SetConfigVar(ctx, connClient, "lifecycle.strategy", "CALENDAR"))
+	strategy, err := GetConfigVar(ctx, connClient, "lifecycle.strategy")
+	require.NoError(t, err)
+	assert.Equal(t, "CALENDAR", strategy)
+
+	require.ErrorContains(t,
+		SetConfigVar(ctx, connClient, "lifecycle.minKeep", "-1"),
+		"lifecycle.minKeep",
+	)
+	persisted, err = GetConfig(ctx, connClient)
+	require.NoError(t, err)
+	assert.Zero(t, *persisted.Lifecycle.MinKeep)
+
+	const profileName = "lifecycle-validation"
+	t.Cleanup(func() {
+		_ = RemoveProfile(context.Background(), connClient, profileName)
+	})
+	profile := &Config{
+		Name:      profileName,
+		IsProfile: true,
+		Storage:   StorageConf{Type: storage.Blackhole},
+		Lifecycle: &LifecycleConf{
+			MinKeep:        &minKeep,
+			DailyRetention: 5,
+		},
+	}
+	require.NoError(t, AddProfile(ctx, connClient, profile))
+
+	invalidProfile := profile.Clone()
+	invalidProfile.Lifecycle.Strategy = "unknown"
+	require.ErrorContains(t, AddProfile(ctx, connClient, invalidProfile), "lifecycle.strategy")
+
+	persistedProfile, err := GetProfile(ctx, connClient, profileName)
+	require.NoError(t, err)
+	assert.Nil(t, persistedProfile.PITR)
+	assert.Nil(t, persistedProfile.Backup)
+	assert.Nil(t, persistedProfile.Restore)
+	require.NotNil(t, persistedProfile.Lifecycle)
+	assert.Equal(t, LifecycleStrategyRolling, persistedProfile.Lifecycle.GetStrategy())
+	assert.Equal(t, 5, persistedProfile.Lifecycle.DailyRetention)
+	assert.Zero(t, *persistedProfile.Lifecycle.MinKeep)
 }
 
 func TestRestoreConfGetIndexCommitQuorum(t *testing.T) {

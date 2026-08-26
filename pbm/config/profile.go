@@ -47,6 +47,10 @@ func GetProfile(ctx context.Context, m connect.Client, name string) (*Config, er
 		return nil, errors.Wrap(err, "decode")
 	}
 
+	if profile.Lifecycle == nil {
+		profile.Lifecycle = &LifecycleConf{}
+	}
+
 	return profile, nil
 }
 
@@ -62,6 +66,9 @@ func AddProfile(ctx context.Context, m connect.Client, profile *Config) error {
 		return errors.Wrap(err, "cast storage")
 	}
 	sanitizeStoragePaths(&profile.Storage)
+	if err := ValidateLifecycle(profile.Lifecycle); err != nil {
+		return err
+	}
 
 	_, err := m.ConfigCollection().ReplaceOne(ctx,
 		bson.D{
